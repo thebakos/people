@@ -100,7 +100,7 @@ export async function POST(request: NextRequest) {
     }
 
     return NextResponse.json(
-      { error: "Failed to process this company. Please try again." },
+      { error: `LinkedIn API error: ${message}` },
       { status: 500 }
     );
   }
