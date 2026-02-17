@@ -90,20 +90,31 @@ export async function POST(request: NextRequest) {
       if (parsed) {
         const included = (parsed.included || []) as Record<string, unknown>[];
         const types = [...new Set(included.map((e) => String(e.$type || "unknown")))];
+
+        // Find an EntityResultViewModel to inspect its full structure
+        const entityResult = included.find((e) =>
+          String(e.$type || "").includes("EntityResultViewModel") ||
+          String(e.$type || "").includes("EntityResult")
+        ) as Record<string, unknown> | undefined;
+
+        // Serialize the entity result, truncating deep values
+        const entityResultSnapshot = entityResult
+          ? Object.fromEntries(
+              Object.entries(entityResult).map(([k, v]) => [
+                k,
+                typeof v === "object" && v !== null
+                  ? JSON.stringify(v).substring(0, 200)
+                  : v,
+              ])
+            )
+          : null;
+
         steps["step3a_clusters"] = {
           status: res.status,
           ok: res.ok,
           includedCount: included.length,
           entityTypes: types,
-          sampleEntities: included.slice(0, 3).map((e) => ({
-            $type: e.$type,
-            entityUrn: e.entityUrn,
-            firstName: e.firstName,
-            lastName: e.lastName,
-            publicIdentifier: e.publicIdentifier,
-            occupation: e.occupation,
-            keys: Object.keys(e),
-          })),
+          entityResultSample: entityResultSnapshot,
         };
       } else {
         steps["step3a_clusters"] = {
