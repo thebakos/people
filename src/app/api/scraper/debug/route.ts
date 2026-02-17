@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { validateAuth, getCompanyInfo } from "@/lib/linkedinApi";
+import { validateAuth, getCompanyInfo, searchCompanyEmployees } from "@/lib/linkedinApi";
 
 /**
  * Debug endpoint to test LinkedIn API connectivity and see raw responses.
@@ -199,6 +199,26 @@ export async function POST(request: NextRequest) {
       }
     } catch (e) {
       steps["step3c_error"] = String(e);
+    }
+
+    // Step 4: End-to-end test using our actual search+parse function
+    try {
+      const employees = await searchCompanyEmployees(
+        companyId,
+        linkedinCookie,
+        5,
+        jsessionId || undefined
+      );
+      steps["step4_parsed"] = {
+        employeeCount: employees.length,
+        employees: employees.map((e) => ({
+          name: e.name,
+          headline: e.headline,
+          url: e.linkedinUrl,
+        })),
+      };
+    } catch (e) {
+      steps["step4_error"] = String(e);
     }
   }
 
