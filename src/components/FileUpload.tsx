@@ -3,7 +3,6 @@
 import { useState, useRef } from "react";
 import { Contact } from "@/lib/types";
 import { v4 as uuidv4 } from "uuid";
-import * as XLSX from "xlsx";
 
 interface FileUploadProps {
   onContactsLoaded: (contacts: Contact[]) => void;
@@ -54,7 +53,7 @@ export default function FileUpload({ onContactsLoaded }: FileUploadProps) {
     setFileName(file.name);
 
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
         const data = e.target?.result;
         if (!data) {
@@ -89,6 +88,7 @@ export default function FileUpload({ onContactsLoaded }: FileUploadProps) {
               return fields;
             });
         } else {
+          const XLSX = await import("xlsx");
           const workbook = XLSX.read(data, { type: "array" });
           const sheet = workbook.Sheets[workbook.SheetNames[0]];
           rows = XLSX.utils.sheet_to_json(sheet, { header: 1 }) as string[][];
