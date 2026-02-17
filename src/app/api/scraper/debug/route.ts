@@ -1,9 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  validateAuth,
-  getCompanyInfo,
-  searchCompanyEmployees,
-} from "@/lib/linkedinApi";
+import { validateAuth, getCompanyInfo } from "@/lib/linkedinApi";
 
 /**
  * Debug endpoint to test LinkedIn API connectivity and see raw responses.
@@ -61,30 +57,183 @@ export async function POST(request: NextRequest) {
     steps["step2_company_error"] = String(e);
   }
 
-  // Step 3: Search test (only if auth is valid and we have a company ID)
-  if (companyId) {
-    if (authValid) {
+  // Step 3: Raw search endpoint tests (to see exactly what LinkedIn returns)
+  if (companyId && authValid) {
+    const csrfToken = jsessionId || `ajax:${Date.now()}`;
+    const headers: Record<string, string> = {
+      Cookie: `li_at=${linkedinCookie}; JSESSIONID="${csrfToken}"`,
+      "Csrf-Token": csrfToken,
+      "X-Restli-Protocol-Version": "2.0.0",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "application/vnd.linkedin.normalized+json+2.1",
+    };
+
+    // 3a: search/dash/clusters
+    try {
+      const params = new URLSearchParams({
+        decorationId:
+          "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186",
+        origin: "COMPANY_PAGE_CANNED_SEARCH",
+        q: "all",
+        query: `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
+        start: "0",
+        count: "5",
+      });
+      const url = `https://www.linkedin.com/voyager/api/search/dash/clusters?${params}`;
+      const res = await fetch(url, { headers });
+      const resBody = await res.text();
+
+      let parsed: Record<string, unknown> | null = null;
       try {
-        const employees = await searchCompanyEmployees(
-          companyId,
-          linkedinCookie,
-          5,
-          jsessionId || undefined
-        );
-        steps["step3_search"] = {
-          employeeCount: employees.length,
-          employees: employees.map((e) => ({
-            name: e.name,
-            headline: e.headline,
-            url: e.linkedinUrl,
+        parsed = JSON.parse(resBody);
+      } catch {
+        // not JSON
+      }
+
+      if (parsed) {
+        const included = (parsed.included || []) as Record<string, unknown>[];
+        const types = [
+          ...new Set(
+            included.map((e) => String(e.$type || "unknown"))
+          ),
+        ];
+        steps["step3a_clusters"] = {
+          status: res.status,
+          ok: res.ok,
+          topKeys: Object.keys(parsed),
+          includedCount: included.length,
+          entityTypes: types,
+          firstThreeEntities: included.slice(0, 3).map((e) => ({
+            $type: e.$type,
+            entityUrn: e.entityUrn,
+            keys: Object.keys(e),
           })),
         };
-      } catch (e) {
-        steps["step3_search_error"] = String(e);
+      } else {
+        steps["step3a_clusters"] = {
+          status: res.status,
+          ok: res.ok,
+          rawBody: resBody.substring(0, 500),
+        };
       }
-    } else {
-      steps["step3_search_skipped"] =
-        "Auth invalid — search requires valid authentication. Get a fresh li_at cookie.";
+    } catch (e) {
+      steps["step3a_error"] = String(e);
+    }
+
+    // 3b: search/blended
+    try {
+      const params = new URLSearchParams({
+        count: "5",
+        filters: `List(currentCompany->${companyId},resultType->PEOPLE)`,
+        origin: "COMPANY_PAGE_CANNED_SEARCH",
+        q: "all",
+        start: "0",
+      });
+      const url = `https://www.linkedin.com/voyager/api/search/blended?${params}`;
+      const res = await fetch(url, { headers });
+      const resBody = await res.text();
+
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = JSON.parse(resBody);
+      } catch {
+        // not JSON
+      }
+
+      if (parsed) {
+        const included = (parsed.included || []) as Record<string, unknown>[];
+        const elements = (parsed.elements || []) as Record<string, unknown>[];
+        const types = [
+          ...new Set(
+            included.map((e) => String(e.$type || "unknown"))
+          ),
+        ];
+        steps["step3b_blended"] = {
+          status: res.status,
+          ok: res.ok,
+          topKeys: Object.keys(parsed),
+          elementsCount: elements.length,
+          includedCount: included.length,
+          entityTypes: types,
+          firstThreeIncluded: included.slice(0, 3).map((e) => ({
+            $type: e.$type,
+            entityUrn: e.entityUrn,
+            keys: Object.keys(e),
+          })),
+        };
+      } else {
+        steps["step3b_blended"] = {
+          status: res.status,
+          ok: res.ok,
+          rawBody: resBody.substring(0, 500),
+        };
+      }
+    } catch (e) {
+      steps["step3b_error"] = String(e);
+    }
+
+    // 3c: graphql people search (alternative endpoint)
+    try {
+      const variables = JSON.stringify({
+        start: 0,
+        count: 5,
+        origin: "COMPANY_PAGE_CANNED_SEARCH",
+        query: {
+          flagshipSearchIntent: "SEARCH_SRP",
+          queryParameters: {
+            currentCompany: [companyId],
+            resultType: ["PEOPLE"],
+          },
+          includeFiltersInResponse: false,
+        },
+      });
+      const params = new URLSearchParams({
+        variables,
+        queryId: "voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0",
+      });
+      const url = `https://www.linkedin.com/voyager/api/graphql?${params}`;
+      const res = await fetch(url, { headers });
+      const resBody = await res.text();
+
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = JSON.parse(resBody);
+      } catch {
+        // not JSON
+      }
+
+      if (parsed) {
+        const included = (parsed.included || []) as Record<string, unknown>[];
+        const types = [
+          ...new Set(
+            included.map((e) => String(e.$type || "unknown"))
+          ),
+        ];
+        steps["step3c_graphql"] = {
+          status: res.status,
+          ok: res.ok,
+          topKeys: Object.keys(parsed),
+          includedCount: included.length,
+          entityTypes: types,
+          firstThreeEntities: included.slice(0, 3).map((e) => ({
+            $type: e.$type,
+            entityUrn: e.entityUrn,
+            firstName: e.firstName,
+            lastName: e.lastName,
+            publicIdentifier: e.publicIdentifier,
+            keys: Object.keys(e),
+          })),
+        };
+      } else {
+        steps["step3c_graphql"] = {
+          status: res.status,
+          ok: res.ok,
+          rawBody: resBody.substring(0, 500),
+        };
+      }
+    } catch (e) {
+      steps["step3c_error"] = String(e);
     }
   }
 
