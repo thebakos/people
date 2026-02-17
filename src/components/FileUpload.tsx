@@ -9,29 +9,75 @@ interface FileUploadProps {
 }
 
 function normalizeHeader(header: string): string {
-  return header.toLowerCase().replace(/[^a-z]/g, "");
+  return header
+    .replace(/^\uFEFF/, "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
 }
 
 function findColumn(headers: string[], candidates: string[]): number {
   return headers.findIndex((h) => candidates.includes(normalizeHeader(h)));
 }
 
-function parseRows(rows: string[][]): Contact[] {
-  if (rows.length < 2) return [];
+function detectDelimiter(text: string): string {
+  const firstLine = text.split(/\r?\n/)[0] || "";
+  const commas = (firstLine.match(/,/g) || []).length;
+  const semicolons = (firstLine.match(/;/g) || []).length;
+  const tabs = (firstLine.match(/\t/g) || []).length;
+  if (tabs >= commas && tabs >= semicolons && tabs > 0) return "\t";
+  if (semicolons > commas && semicolons > 0) return ";";
+  return ",";
+}
 
-  const headers = rows[0];
-  const nameCol = findColumn(headers, ["contactname", "name", "fullname", "contact"]);
-  const companyCol = findColumn(headers, ["companyname", "company", "organization", "org"]);
-  const emailCol = findColumn(headers, ["email", "emailaddress", "mail"]);
+function splitCSVLine(line: string, delimiter: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === delimiter && !inQuotes) {
+      fields.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  fields.push(current);
+  return fields;
+}
 
-  if (nameCol === -1 && companyCol === -1 && emailCol === -1) {
-    return [];
+function parseRows(rows: string[][]): { contacts: Contact[]; headers: string[] } {
+  if (rows.length < 2) return { contacts: [], headers: [] };
+
+  const headers = rows[0].map((h) => h.replace(/^\uFEFF/, "").trim());
+  const nameCol = findColumn(headers, [
+    "contactname", "name", "fullname", "contact", "contactperson",
+  ]);
+  const firstNameCol = findColumn(headers, ["firstname", "first", "givenname", "prenom"]);
+  const lastNameCol = findColumn(headers, ["lastname", "last", "surname", "familyname", "nom"]);
+  const companyCol = findColumn(headers, [
+    "companyname", "company", "organization", "org", "organisation", "employer", "business",
+  ]);
+  const emailCol = findColumn(headers, ["email", "emailaddress", "mail", "emailid", "workemail"]);
+
+  const hasName = nameCol !== -1 || firstNameCol !== -1 || lastNameCol !== -1;
+  if (!hasName && companyCol === -1 && emailCol === -1) {
+    return { contacts: [], headers };
   }
 
   const contacts: Contact[] = [];
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
-    const name = (nameCol !== -1 ? row[nameCol] : "")?.trim() || "";
+    let name = "";
+    if (nameCol !== -1) {
+      name = row[nameCol]?.trim() || "";
+    } else {
+      const first = (firstNameCol !== -1 ? row[firstNameCol] : "")?.trim() || "";
+      const last = (lastNameCol !== -1 ? row[lastNameCol] : "")?.trim() || "";
+      name = [first, last].filter(Boolean).join(" ");
+    }
     const company = (companyCol !== -1 ? row[companyCol] : "")?.trim() || "";
     const email = (emailCol !== -1 ? row[emailCol] : "")?.trim() || "";
 
@@ -39,7 +85,7 @@ function parseRows(rows: string[][]): Contact[] {
       contacts.push({ id: uuidv4(), name, company, email });
     }
   }
-  return contacts;
+  return { contacts, headers };
 }
 
 export default function FileUpload({ onContactsLoaded }: FileUploadProps) {
@@ -64,29 +110,12 @@ export default function FileUpload({ onContactsLoaded }: FileUploadProps) {
         let rows: string[][] = [];
 
         if (file.name.endsWith(".csv")) {
-          const text = data as string;
+          const text = (data as string).replace(/^\uFEFF/, "");
+          const delimiter = detectDelimiter(text);
           rows = text
             .split(/\r?\n/)
             .filter((line) => line.trim())
-            .map((line) => {
-              // Handle quoted CSV fields
-              const fields: string[] = [];
-              let current = "";
-              let inQuotes = false;
-              for (let i = 0; i < line.length; i++) {
-                const ch = line[i];
-                if (ch === '"') {
-                  inQuotes = !inQuotes;
-                } else if (ch === "," && !inQuotes) {
-                  fields.push(current);
-                  current = "";
-                } else {
-                  current += ch;
-                }
-              }
-              fields.push(current);
-              return fields;
-            });
+            .map((line) => splitCSVLine(line, delimiter));
         } else {
           const XLSX = await import("xlsx");
           const workbook = XLSX.read(data, { type: "array" });
@@ -94,11 +123,14 @@ export default function FileUpload({ onContactsLoaded }: FileUploadProps) {
           rows = XLSX.utils.sheet_to_json(sheet, { header: 1 }) as string[][];
         }
 
-        const contacts = parseRows(rows);
+        const { contacts, headers } = parseRows(rows);
 
         if (contacts.length === 0) {
+          const detected = headers.length > 0
+            ? ` Detected columns: ${headers.map((h) => `"${h}"`).join(", ")}.`
+            : "";
           setError(
-            'No contacts found. Make sure the file has columns like "Company Name", "Contact Name", and "Email".'
+            `No contacts found. Make sure the file has columns like "Company Name", "Contact Name" (or "First Name" / "Last Name"), and "Email".${detected}`
           );
           return;
         }
