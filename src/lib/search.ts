@@ -81,18 +81,20 @@ export async function searchLinkedIn(
 
 export async function searchWeb(params: SearchParams): Promise<Person[]> {
   const query = [
-    "site:linkedin.com/in/",
+    "site:linkedin.com/in",
     params.query,
-    params.title ? `"${params.title}"` : "",
-    params.company ? `"${params.company}"` : "",
+    params.title || "",
+    params.company || "",
     params.location || "",
   ]
     .filter(Boolean)
     .join(" ");
 
-  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=10`;
+  // Use DuckDuckGo HTML search — doesn't block server-side requests like Google does
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
   const response = await fetch(url, {
+    method: "POST",
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -102,48 +104,66 @@ export async function searchWeb(params: SearchParams): Promise<Person[]> {
   });
 
   if (!response.ok) {
-    throw new Error(`Google search error (${response.status})`);
+    throw new Error(`Search error (${response.status})`);
   }
 
   const html = await response.text();
   const results: Person[] = [];
 
-  // Extract LinkedIn profile URLs from search results
-  const linkedinUrlPattern = /https?:\/\/[a-z]+\.linkedin\.com\/in\/[\w-]+/g;
-  const urls = [...new Set(html.match(linkedinUrlPattern) || [])];
+  // DuckDuckGo result links contain uddg= parameter with the actual URL
+  const resultPattern = /href="[^"]*uddg=(https?%3A%2F%2F[a-z]+\.linkedin\.com%2Fin%2F[^&"]+)[^"]*"[^>]*>([^<]*)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  let match;
+  while ((match = resultPattern.exec(html)) !== null && results.length < 10) {
+    const linkedinUrl = decodeURIComponent(match[1]);
+    const title = match[2].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&#x27;/g, "'").replace(/&quot;/g, '"').trim();
+    const snippet = match[3].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&#x27;/g, "'").replace(/&quot;/g, '"').trim();
 
-  // Extract titles/snippets near each URL
-  for (const linkedinUrl of urls.slice(0, 10)) {
-    const username = linkedinUrl.split("/in/")[1]?.replace(/\/$/, "") || "";
-    // Try to find associated text in the HTML near this URL
-    const escapedUrl = linkedinUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const contextPattern = new RegExp(
-      escapedUrl + "[^<]*<\\/a>\\s*[^<]*(?:<[^>]+>)*\\s*(?:<[^>]+>)*([^<]{0,300})",
-      "i"
-    );
-    const contextMatch = html.match(contextPattern);
-    const snippet = contextMatch?.[1]?.replace(/&#?\w+;/g, " ").trim() || "";
+    // Extract name from title (usually "Name - Title - LinkedIn")
+    const titleParts = title.split(/\s*[-–—|]\s*/);
+    const name = titleParts[0]?.trim() || "";
+    const jobTitle = titleParts[1]?.trim() || "";
 
-    // Parse name from LinkedIn URL slug
-    const nameParts = username.split("-").filter((p: string) => !/^\d+$/.test(p));
-    const name = nameParts
-      .map((p: string) => p.charAt(0).toUpperCase() + p.slice(1))
-      .join(" ");
+    if (name) {
+      results.push({
+        id: uuidv4(),
+        name,
+        title: jobTitle,
+        company: "",
+        location: params.location || "",
+        linkedinUrl,
+        email: "",
+        summary: snippet,
+        source: "web" as const,
+      });
+    }
+  }
 
-    // Try to extract title/company from snippet
-    const titleMatch = snippet.match(/[-–]\s*(.+?)(?:\s*[-–]|$)/);
+  // Fallback: extract LinkedIn URLs if the structured pattern didn't match
+  if (results.length === 0) {
+    const urlPattern = /uddg=(https?%3A%2F%2F[a-z]+\.linkedin\.com%2Fin%2F[^&"]+)/g;
+    let urlMatch;
+    while ((urlMatch = urlPattern.exec(html)) !== null && results.length < 10) {
+      const linkedinUrl = decodeURIComponent(urlMatch[1]);
+      const username = linkedinUrl.split("/in/")[1]?.replace(/\/$/, "") || "";
+      const nameParts = username.split("-").filter((p: string) => !/^\d+$/.test(p));
+      const name = nameParts
+        .map((p: string) => p.charAt(0).toUpperCase() + p.slice(1))
+        .join(" ");
 
-    results.push({
-      id: uuidv4(),
-      name: name || "Unknown",
-      title: titleMatch?.[1]?.trim() || "",
-      company: "",
-      location: params.location || "",
-      linkedinUrl,
-      email: "",
-      summary: snippet,
-      source: "web" as const,
-    });
+      if (name) {
+        results.push({
+          id: uuidv4(),
+          name,
+          title: "",
+          company: "",
+          location: params.location || "",
+          linkedinUrl,
+          email: "",
+          summary: "",
+          source: "web" as const,
+        });
+      }
+    }
   }
 
   return results;
