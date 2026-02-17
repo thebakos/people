@@ -2,8 +2,6 @@ import { Person, SearchParams } from "./types";
 import { v4 as uuidv4 } from "uuid";
 
 const PROXYCURL_API_KEY = process.env.PROXYCURL_API_KEY;
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID;
 
 export async function searchLinkedIn(
   params: SearchParams
@@ -82,74 +80,71 @@ export async function searchLinkedIn(
 }
 
 export async function searchWeb(params: SearchParams): Promise<Person[]> {
-  if (!GOOGLE_API_KEY || !GOOGLE_SEARCH_ENGINE_ID) {
-    throw new Error(
-      "GOOGLE_API_KEY and GOOGLE_SEARCH_ENGINE_ID are not configured"
-    );
-  }
-
   const query = [
+    "site:linkedin.com/in/",
     params.query,
     params.title ? `"${params.title}"` : "",
     params.company ? `"${params.company}"` : "",
     params.location || "",
-    "email contact",
   ]
     .filter(Boolean)
     .join(" ");
 
-  const searchParams = new URLSearchParams({
-    key: GOOGLE_API_KEY,
-    cx: GOOGLE_SEARCH_ENGINE_ID,
-    q: query,
-    num: "10",
+  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=10`;
+
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
   });
 
-  const response = await fetch(
-    `https://www.googleapis.com/customsearch/v1?${searchParams.toString()}`
-  );
-
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `Google Search API error (${response.status}): ${errorText}`
-    );
+    throw new Error(`Google search error (${response.status})`);
   }
 
-  const data = await response.json();
-  const results: Person[] = (data.items || []).map(
-    (item: {
-      title?: string;
-      snippet?: string;
-      link?: string;
-      pagemap?: {
-        person?: Array<{ name?: string; jobtitle?: string; org?: string }>;
-        metatags?: Array<{
-          "og:title"?: string;
-          "og:description"?: string;
-        }>;
-      };
-    }) => {
-      const person = item.pagemap?.person?.[0];
-      const emailMatch = item.snippet?.match(
-        /[\w.+-]+@[\w-]+\.[\w.-]+/
-      );
+  const html = await response.text();
+  const results: Person[] = [];
 
-      return {
-        id: uuidv4(),
-        name: person?.name || item.title?.split(/[|\-–]/)[0]?.trim() || "Unknown",
-        title: person?.jobtitle || "",
-        company: person?.org || "",
-        location: "",
-        linkedinUrl: item.link?.includes("linkedin.com")
-          ? item.link
-          : "",
-        email: emailMatch ? emailMatch[0] : "",
-        summary: item.snippet || "",
-        source: "web" as const,
-      };
-    }
-  );
+  // Extract LinkedIn profile URLs from search results
+  const linkedinUrlPattern = /https?:\/\/[a-z]+\.linkedin\.com\/in\/[\w-]+/g;
+  const urls = [...new Set(html.match(linkedinUrlPattern) || [])];
+
+  // Extract titles/snippets near each URL
+  for (const linkedinUrl of urls.slice(0, 10)) {
+    const username = linkedinUrl.split("/in/")[1]?.replace(/\/$/, "") || "";
+    // Try to find associated text in the HTML near this URL
+    const escapedUrl = linkedinUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const contextPattern = new RegExp(
+      escapedUrl + "[^<]*<\\/a>\\s*[^<]*(?:<[^>]+>)*\\s*(?:<[^>]+>)*([^<]{0,300})",
+      "i"
+    );
+    const contextMatch = html.match(contextPattern);
+    const snippet = contextMatch?.[1]?.replace(/&#?\w+;/g, " ").trim() || "";
+
+    // Parse name from LinkedIn URL slug
+    const nameParts = username.split("-").filter((p: string) => !/^\d+$/.test(p));
+    const name = nameParts
+      .map((p: string) => p.charAt(0).toUpperCase() + p.slice(1))
+      .join(" ");
+
+    // Try to extract title/company from snippet
+    const titleMatch = snippet.match(/[-–]\s*(.+?)(?:\s*[-–]|$)/);
+
+    results.push({
+      id: uuidv4(),
+      name: name || "Unknown",
+      title: titleMatch?.[1]?.trim() || "",
+      company: "",
+      location: params.location || "",
+      linkedinUrl,
+      email: "",
+      summary: snippet,
+      source: "web" as const,
+    });
+  }
 
   return results;
 }
