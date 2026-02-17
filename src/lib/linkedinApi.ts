@@ -338,55 +338,114 @@ async function trySearchBlended(
 }
 
 /**
+ * Extract text from a LinkedIn title/subtitle field.
+ * LinkedIn API returns these as either:
+ *   - An object: { text: "Name", textDirection: "...", ... }
+ *   - A JSON string: '{"text":"Name","textDirection":"..."}'
+ *   - A plain string: "Name"
+ */
+function extractText(value: unknown): string {
+  if (!value) return "";
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj.text === "string") return obj.text;
+  }
+  if (typeof value === "string") {
+    if (value.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(value);
+        if (typeof parsed.text === "string") return parsed.text;
+      } catch {
+        /* not JSON */
+      }
+    }
+    return value;
+  }
+  return "";
+}
+
+/**
+ * Extract a LinkedIn profile URL from various entity fields.
+ * Checks navigationUrl, navigationContext.url, and entityUrn.
+ */
+function extractProfileUrl(entity: Record<string, unknown>): string {
+  // Try navigationUrl first (direct string)
+  const candidates: string[] = [];
+
+  if (typeof entity.navigationUrl === "string") {
+    candidates.push(entity.navigationUrl);
+  }
+
+  // Try navigationContext (object or JSON string with url property)
+  const navCtx = entity.navigationContext;
+  if (navCtx && typeof navCtx === "object") {
+    const url = (navCtx as Record<string, unknown>).url;
+    if (typeof url === "string") candidates.push(url);
+  } else if (typeof navCtx === "string" && navCtx.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(navCtx);
+      if (typeof parsed.url === "string") candidates.push(parsed.url);
+    } catch {
+      /* not JSON */
+    }
+  }
+
+  for (const raw of candidates) {
+    const match = raw.match(/linkedin\.com\/in\/([^/?#]+)/);
+    if (match) return `https://www.linkedin.com/in/${match[1]}`;
+  }
+
+  return "";
+}
+
+/**
  * Parse LinkedIn search API response to extract employee info.
- * Handles both { data, included } and { elements, included } formats.
+ * Handles multiple response formats:
+ *   - MiniProfile entities (older/blended search): firstName, lastName, publicIdentifier
+ *   - EntityResultViewModel entities (dash/clusters search): title.text, navigationUrl
  */
 function parseSearchResults(
   json: Record<string, unknown>,
   limit: number
 ): LinkedInEmployee[] {
   const employees: LinkedInEmployee[] = [];
-
-  // Get all entities from the response
   const included = (json.included || []) as Record<string, unknown>[];
+  const seen = new Set<string>();
 
-  // Look for profile/mini-profile entities
+  const addEmployee = (
+    name: string,
+    headline: string,
+    linkedinUrl: string
+  ): boolean => {
+    if (!name || name === "LinkedIn Member" || !linkedinUrl) return false;
+    if (seen.has(linkedinUrl)) return false;
+    seen.add(linkedinUrl);
+    employees.push({ name, headline, linkedinUrl });
+    return true;
+  };
+
+  // Strategy 1: MiniProfile entities (richest data — has firstName, lastName, publicIdentifier)
   for (const entity of included) {
     if (employees.length >= limit) break;
 
     const type = String(entity.$type || "");
-    const entityUrn = String(entity.entityUrn || "");
-
-    // Match profile entities
     const isProfile =
       type.includes("MiniProfile") ||
-      type.includes("identity.profile.Profile") ||
-      type.includes("identity.shared.MiniProfile") ||
-      entityUrn.includes("fs_miniProfile") ||
-      entityUrn.includes("fsd_profile");
+      type.includes("identity.shared.MiniProfile");
 
     if (!isProfile) continue;
 
     const firstName = String(entity.firstName || "");
     const lastName = String(entity.lastName || "");
     const name = `${firstName} ${lastName}`.trim();
-
-    if (!name || name === "LinkedIn Member") continue;
-
-    const occupation = String(entity.occupation || "");
-    const headline = String(entity.headline || occupation || "");
-
     const publicId = String(entity.publicIdentifier || "");
-    if (!publicId) continue;
+    if (!name || !publicId) continue;
 
-    const linkedinUrl = `https://www.linkedin.com/in/${publicId}`;
-
-    if (employees.some((e) => e.linkedinUrl === linkedinUrl)) continue;
-
-    employees.push({ name, headline, linkedinUrl });
+    const headline = String(entity.occupation || entity.headline || "");
+    addEmployee(name, headline, `https://www.linkedin.com/in/${publicId}`);
   }
 
-  // Fallback: look for EntityResultViewModel entities (newer search format)
+  // Strategy 2: EntityResultViewModel entities (dash/clusters search result cards)
   if (employees.length === 0) {
     for (const entity of included) {
       if (employees.length >= limit) break;
@@ -394,39 +453,16 @@ function parseSearchResults(
       const type = String(entity.$type || "");
       if (
         !type.includes("EntityResultViewModel") &&
-        !type.includes("SearchHitV2") &&
-        !type.includes("EntityResult")
+        !type.includes("SearchHitV2")
       ) {
         continue;
       }
 
-      // Extract name from title
-      const title = entity.title as { text?: string } | undefined;
-      const name = title?.text || "";
-      if (!name || name === "LinkedIn Member") continue;
+      const name = extractText(entity.title);
+      const headline = extractText(entity.primarySubtitle);
+      const profileUrl = extractProfileUrl(entity);
 
-      const summary = entity.primarySubtitle as
-        | { text?: string }
-        | undefined;
-      const headline = summary?.text || "";
-
-      // Extract profile URL from navigationUrl or navigationContext
-      let profileUrl = "";
-      const navUrl = String(entity.navigationUrl || "");
-      const navCtx = entity.navigationContext as
-        | { url?: string }
-        | undefined;
-      const rawUrl = navUrl || navCtx?.url || "";
-
-      const profileMatch = rawUrl.match(/linkedin\.com\/in\/([^/?#]+)/);
-      if (profileMatch) {
-        profileUrl = `https://www.linkedin.com/in/${profileMatch[1]}`;
-      }
-
-      if (!profileUrl) continue;
-      if (employees.some((e) => e.linkedinUrl === profileUrl)) continue;
-
-      employees.push({ name, headline, linkedinUrl: profileUrl });
+      addEmployee(name, headline, profileUrl);
     }
   }
 
