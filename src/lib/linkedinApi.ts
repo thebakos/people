@@ -250,11 +250,12 @@ export async function getCompanyInfo(
 
 /**
  * Search for employees at a company using LinkedIn's Voyager search API.
+ * Paginates through multiple pages to collect up to `limit` results.
  */
 export async function searchCompanyEmployees(
   companyId: string,
   liAtCookie: string,
-  limit: number = 10,
+  limit: number = 50,
   jsessionId?: string
 ): Promise<LinkedInEmployee[]> {
   const headers = buildHeaders(liAtCookie, jsessionId);
@@ -279,35 +280,61 @@ async function trySearchDashClusters(
     "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165",
   ];
 
-  const count = Math.min(limit, 49);
+  const pageSize = Math.min(49, limit);
+  const allEmployees: LinkedInEmployee[] = [];
+  const seen = new Set<string>();
 
   for (const decorationId of decorationIds) {
-    try {
-      // IMPORTANT: Build URL manually — URLSearchParams encodes parentheses/colons
-      // which breaks LinkedIn's proprietary query format
-      const query = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
-      const url =
-        `${LINKEDIN_API_BASE}/search/dash/clusters` +
-        `?decorationId=${encodeURIComponent(decorationId)}` +
-        `&origin=COMPANY_PAGE_CANNED_SEARCH` +
-        `&q=all` +
-        `&query=${query}` +
-        `&start=0` +
-        `&count=${count}`;
+    let start = 0;
 
-      const response = await fetch(url, { headers });
+    while (allEmployees.length < limit) {
+      try {
+        const query = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
+        const url =
+          `${LINKEDIN_API_BASE}/search/dash/clusters` +
+          `?decorationId=${encodeURIComponent(decorationId)}` +
+          `&origin=COMPANY_PAGE_CANNED_SEARCH` +
+          `&q=all` +
+          `&query=${query}` +
+          `&start=${start}` +
+          `&count=${pageSize}`;
 
-      if (!response.ok) continue;
+        const response = await fetch(url, { headers });
+        if (!response.ok) break;
 
-      const json = await response.json();
-      const employees = parseSearchResults(json, limit);
-      if (employees.length > 0) return employees;
-    } catch {
-      continue;
+        const json = await response.json();
+        const pageEmployees = parseSearchResults(json, limit);
+
+        if (pageEmployees.length === 0) break;
+
+        let addedNew = false;
+        for (const emp of pageEmployees) {
+          if (allEmployees.length >= limit) break;
+          if (seen.has(emp.linkedinUrl)) continue;
+          seen.add(emp.linkedinUrl);
+          allEmployees.push(emp);
+          addedNew = true;
+        }
+
+        // If no new unique employees found, stop paginating
+        if (!addedNew) break;
+
+        start += pageSize;
+
+        // Rate limit between pages
+        if (allEmployees.length < limit) {
+          await delay(400);
+        }
+      } catch {
+        break;
+      }
     }
+
+    // If this decorationId worked (got results), don't try others
+    if (allEmployees.length > 0) break;
   }
 
-  return [];
+  return allEmployees;
 }
 
 async function trySearchBlended(
@@ -315,26 +342,51 @@ async function trySearchBlended(
   headers: Record<string, string>,
   limit: number
 ): Promise<LinkedInEmployee[]> {
-  try {
-    const count = Math.min(limit, 49);
-    // Build URL manually to avoid encoding List() and -> syntax
-    const url =
-      `${LINKEDIN_API_BASE}/search/blended` +
-      `?count=${count}` +
-      `&filters=List(currentCompany->${companyId},resultType->PEOPLE)` +
-      `&origin=COMPANY_PAGE_CANNED_SEARCH` +
-      `&q=all` +
-      `&start=0`;
+  const pageSize = Math.min(49, limit);
+  const allEmployees: LinkedInEmployee[] = [];
+  const seen = new Set<string>();
+  let start = 0;
 
-    const response = await fetch(url, { headers });
+  while (allEmployees.length < limit) {
+    try {
+      const url =
+        `${LINKEDIN_API_BASE}/search/blended` +
+        `?count=${pageSize}` +
+        `&filters=List(currentCompany->${companyId},resultType->PEOPLE)` +
+        `&origin=COMPANY_PAGE_CANNED_SEARCH` +
+        `&q=all` +
+        `&start=${start}`;
 
-    if (!response.ok) return [];
+      const response = await fetch(url, { headers });
+      if (!response.ok) break;
 
-    const json = await response.json();
-    return parseSearchResults(json, limit);
-  } catch {
-    return [];
+      const json = await response.json();
+      const pageEmployees = parseSearchResults(json, limit);
+
+      if (pageEmployees.length === 0) break;
+
+      let addedNew = false;
+      for (const emp of pageEmployees) {
+        if (allEmployees.length >= limit) break;
+        if (seen.has(emp.linkedinUrl)) continue;
+        seen.add(emp.linkedinUrl);
+        allEmployees.push(emp);
+        addedNew = true;
+      }
+
+      if (!addedNew) break;
+
+      start += pageSize;
+
+      if (allEmployees.length < limit) {
+        await delay(400);
+      }
+    } catch {
+      break;
+    }
   }
+
+  return allEmployees;
 }
 
 /**
@@ -475,7 +527,7 @@ function parseSearchResults(
 export async function findCompanyEmployees(
   companyUrl: string,
   liAtCookie: string,
-  limit: number = 10
+  limit: number = 50
 ): Promise<{
   companyName: string;
   employees: LinkedInEmployee[];

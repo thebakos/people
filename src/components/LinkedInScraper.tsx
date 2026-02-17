@@ -148,11 +148,11 @@ export default function LinkedInScraper({
   const handleDownloadCSV = useCallback(() => {
     if (allResults.length === 0) return;
 
-    const header = "Company Name,Contact Name,Email\n";
+    const header = "Company Name,Contact Name,Headline,LinkedIn URL,Email\n";
     const rows = allResults
       .map(
         (r) =>
-          `"${escapeCsv(r.companyName)}","${escapeCsv(r.contactName)}","${escapeCsv(r.email)}"`
+          `"${escapeCsv(r.companyName)}","${escapeCsv(r.contactName)}","${escapeCsv(r.headline || "")}","${escapeCsv(r.linkedinUrl)}","${escapeCsv(r.email)}"`
       )
       .join("\n");
 
@@ -272,7 +272,7 @@ export default function LinkedInScraper({
           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none disabled:bg-gray-50 disabled:text-gray-400"
         />
         <p className="text-xs text-gray-500 mt-1">
-          Enter one URL per line. Finds up to 10 employees per company
+          Enter one URL per line. Finds up to 50 employees per company
           {linkedinCookie ? "" : " (connect LinkedIn above for best results)"}.
         </p>
       </div>
@@ -369,10 +369,10 @@ export default function LinkedInScraper({
               <thead className="bg-gray-50">
                 <tr>
                   <th className="text-left px-3 py-2 font-medium text-gray-700">
-                    Company Name
+                    Name
                   </th>
                   <th className="text-left px-3 py-2 font-medium text-gray-700">
-                    Contact Name
+                    Headline
                   </th>
                   <th className="text-left px-3 py-2 font-medium text-gray-700">
                     Email
@@ -385,15 +385,24 @@ export default function LinkedInScraper({
               <tbody className="divide-y divide-gray-100">
                 {allResults.map((r, i) => (
                   <tr key={i} className="hover:bg-gray-50">
-                    <td className="px-3 py-2 text-gray-800">
-                      {r.companyName}
-                    </td>
-                    <td className="px-3 py-2 text-gray-800">
+                    <td className="px-3 py-2 text-gray-800 font-medium whitespace-nowrap">
                       {r.contactName}
+                    </td>
+                    <td className="px-3 py-2 text-gray-600 max-w-[250px]">
+                      <span className="line-clamp-2" title={r.headline || ""}>
+                        {r.headline || (
+                          <span className="text-gray-400 italic">—</span>
+                        )}
+                      </span>
                     </td>
                     <td className="px-3 py-2">
                       {r.email ? (
-                        <span className="text-gray-800">{r.email}</span>
+                        <a
+                          href={`mailto:${r.email}`}
+                          className="text-gray-800 hover:text-blue-600 hover:underline"
+                        >
+                          {r.email}
+                        </a>
                       ) : (
                         <span className="text-gray-400 italic">
                           Not found
@@ -405,9 +414,9 @@ export default function LinkedInScraper({
                         href={r.linkedinUrl}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline truncate block max-w-[200px]"
+                        className="text-blue-600 hover:underline break-all text-xs"
                       >
-                        Profile
+                        {r.linkedinUrl}
                       </a>
                     </td>
                   </tr>

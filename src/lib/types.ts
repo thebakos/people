@@ -26,6 +26,7 @@ export interface GmailTokens {
 export interface ScraperResult {
   companyName: string;
   contactName: string;
+  headline: string;
   linkedinUrl: string;
   email: string;
 }

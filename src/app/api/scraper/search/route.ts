@@ -7,6 +7,52 @@ import { ScraperResult } from "@/lib/types";
 
 export const maxDuration = 120; // Allow up to 2 minutes for processing
 
+/** Process a batch of employees for email lookup in parallel */
+async function findEmailsBatch(
+  employees: { name: string; linkedinUrl: string; headline: string }[],
+  companyName: string,
+  batchSize: number = 5
+): Promise<ScraperResult[]> {
+  const results: ScraperResult[] = [];
+
+  // Process in batches to avoid overwhelming DuckDuckGo
+  for (let i = 0; i < employees.length; i += batchSize) {
+    const batch = employees.slice(i, i + batchSize);
+
+    const batchResults = await Promise.allSettled(
+      batch.map(async (emp) => {
+        let email = "";
+        try {
+          const found = await findEmail(emp.name, companyName);
+          if (found) email = found;
+        } catch (e) {
+          console.error(`Email search failed for ${emp.name}:`, e);
+        }
+        return {
+          companyName,
+          contactName: emp.name,
+          headline: emp.headline,
+          linkedinUrl: emp.linkedinUrl,
+          email,
+        } satisfies ScraperResult;
+      })
+    );
+
+    for (const result of batchResults) {
+      if (result.status === "fulfilled") {
+        results.push(result.value);
+      }
+    }
+
+    // Small delay between batches to respect rate limits
+    if (i + batchSize < employees.length) {
+      await delay(500);
+    }
+  }
+
+  return results;
+}
+
 export async function POST(request: NextRequest) {
   let body: { url: string; linkedinCookie?: string };
   try {
@@ -41,7 +87,7 @@ export async function POST(request: NextRequest) {
       companyName = result.companyName;
       employees = result.employees;
     } else {
-      // Fallback: use DuckDuckGo (may return 0 results)
+      // Fallback: use DuckDuckGo search (may return fewer results)
       console.log("No LinkedIn cookie — falling back to DuckDuckGo search...");
       companyName = await getCompanyName(url);
       await delay(1000);
@@ -58,29 +104,8 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // For each employee, try to find their email
-    const results: ScraperResult[] = [];
-
-    for (const emp of employees) {
-      await delay(1200);
-
-      let email = "";
-      try {
-        const found = await findEmail(emp.name, companyName);
-        if (found) {
-          email = found;
-        }
-      } catch (e) {
-        console.error(`Email search failed for ${emp.name}:`, e);
-      }
-
-      results.push({
-        companyName,
-        contactName: emp.name,
-        linkedinUrl: emp.linkedinUrl,
-        email,
-      });
-    }
+    // Find emails in parallel batches (5 at a time)
+    const results = await findEmailsBatch(employees, companyName, 5);
 
     return NextResponse.json({ companyName, results });
   } catch (error) {
