@@ -1,22 +1,8 @@
-export interface Person {
+export interface Contact {
   id: string;
   name: string;
-  title?: string;
-  company?: string;
-  location?: string;
-  linkedinUrl?: string;
-  email?: string;
-  summary?: string;
-  source: "linkedin" | "web";
-}
-
-export interface SearchParams {
-  query: string;
-  source: "linkedin" | "web" | "both";
-  keywords?: string;
-  location?: string;
-  company?: string;
-  title?: string;
+  company: string;
+  email: string;
 }
 
 export interface EmailTemplate {
@@ -25,7 +11,7 @@ export interface EmailTemplate {
 }
 
 export interface DraftEmail {
-  personId: string;
+  contactId: string;
   to: string;
   subject: string;
   body: string;

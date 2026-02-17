@@ -1,25 +1,21 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Person, SearchParams, DraftEmail, GmailTokens } from "@/lib/types";
-import SearchForm from "@/components/SearchForm";
-import PeopleTable from "@/components/PeopleTable";
+import { Contact, DraftEmail, GmailTokens } from "@/lib/types";
+import FileUpload from "@/components/FileUpload";
+import ContactsTable from "@/components/ContactsTable";
 import EmailComposer from "@/components/EmailComposer";
 import GmailConnect from "@/components/GmailConnect";
-import SaveLoadList from "@/components/SaveLoadList";
 
-type Step = "search" | "review" | "email" | "send";
+type Step = "upload" | "compose" | "send";
 
 export default function Home() {
-  const [step, setStep] = useState<Step>("search");
-  const [people, setPeople] = useState<Person[]>([]);
+  const [step, setStep] = useState<Step>("upload");
+  const [contacts, setContacts] = useState<Contact[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [isSearching, setIsSearching] = useState(false);
-  const [searchError, setSearchError] = useState("");
   const [drafts, setDrafts] = useState<DraftEmail[]>([]);
   const [gmailTokens, setGmailTokens] = useState<GmailTokens | null>(null);
   const [gmailEmail, setGmailEmail] = useState("");
-  const [currentListName, setCurrentListName] = useState("");
 
   // Handle Gmail OAuth callback params
   useEffect(() => {
@@ -39,7 +35,6 @@ export default function Home() {
           console.error("Failed to parse Gmail tokens");
         }
       }
-      // Clean up URL
       window.history.replaceState({}, "", "/");
     }
 
@@ -56,33 +51,9 @@ export default function Home() {
     }
   }, []);
 
-  const handleSearch = async (params: SearchParams) => {
-    setIsSearching(true);
-    setSearchError("");
-
-    try {
-      const response = await fetch("/api/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(params),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Search failed");
-      }
-
-      setPeople(data.results || []);
-      setSelectedIds(new Set((data.results || []).map((p: Person) => p.id)));
-      setStep("review");
-    } catch (error) {
-      setSearchError(
-        error instanceof Error ? error.message : "Search failed"
-      );
-    } finally {
-      setIsSearching(false);
-    }
+  const handleContactsLoaded = (loaded: Contact[]) => {
+    setContacts(loaded);
+    setSelectedIds(new Set(loaded.map((c) => c.id)));
   };
 
   const handleToggleSelect = useCallback((id: string) => {
@@ -96,27 +67,29 @@ export default function Home() {
 
   const handleSelectAll = useCallback(() => {
     setSelectedIds((prev) =>
-      prev.size === people.length
+      prev.size === contacts.length
         ? new Set()
-        : new Set(people.map((p) => p.id))
+        : new Set(contacts.map((c) => c.id))
     );
-  }, [people]);
+  }, [contacts]);
 
-  const handleUpdatePerson = useCallback(
-    (id: string, updates: Partial<Person>) => {
-      setPeople((prev) =>
-        prev.map((p) => (p.id === id ? { ...p, ...updates } : p))
+  const handleUpdateContact = useCallback(
+    (id: string, updates: Partial<Contact>) => {
+      setContacts((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, ...updates } : c))
       );
     },
     []
   );
 
-  const handleLoadPeople = (loadedPeople: Person[], listName: string) => {
-    setPeople(loadedPeople);
-    setSelectedIds(new Set(loadedPeople.map((p) => p.id)));
-    setCurrentListName(listName);
-    setStep("review");
-  };
+  const handleRemoveContact = useCallback((id: string) => {
+    setContacts((prev) => prev.filter((c) => c.id !== id));
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
 
   const handleDraftsReady = (newDrafts: DraftEmail[]) => {
     setDrafts(newDrafts);
@@ -137,23 +110,26 @@ export default function Home() {
     }
   };
 
-  const steps: { key: Step; label: string }[] = [
-    { key: "search", label: "1. Search" },
-    { key: "review", label: "2. Review" },
-    { key: "email", label: "3. Email" },
-    { key: "send", label: "4. Send" },
+  const steps: { key: Step; label: string; num: number }[] = [
+    { key: "upload", label: "Upload Contacts", num: 1 },
+    { key: "compose", label: "Compose Email", num: 2 },
+    { key: "send", label: "Create Drafts", num: 3 },
   ];
+
+  const selectedWithEmail = contacts.filter(
+    (c) => selectedIds.has(c.id) && c.email
+  ).length;
 
   return (
     <div className="min-h-screen bg-gray-50">
       <header className="bg-white border-b border-gray-200">
         <div className="max-w-5xl mx-auto px-4 py-4">
           <h1 className="text-xl font-bold text-gray-900">
-            People Finder & Email Outreach
+            Email Outreach
           </h1>
           <p className="text-sm text-gray-500 mt-0.5">
-            Search LinkedIn & the web, build lists, and draft personalized
-            emails
+            Upload contacts, compose a personalized email, and create Gmail
+            drafts
           </p>
         </div>
       </header>
@@ -166,8 +142,7 @@ export default function Home() {
               key={s.key}
               onClick={() => setStep(s.key)}
               disabled={
-                (s.key === "review" && people.length === 0) ||
-                (s.key === "email" && selectedIds.size === 0) ||
+                (s.key === "compose" && contacts.length === 0) ||
                 (s.key === "send" && drafts.length === 0)
               }
               className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${
@@ -176,7 +151,7 @@ export default function Home() {
                   : "bg-white text-gray-600 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
               }`}
             >
-              {s.label}
+              {s.num}. {s.label}
             </button>
           ))}
         </div>
@@ -187,64 +162,52 @@ export default function Home() {
           {/* Main content */}
           <div className="lg:col-span-2">
             <div className="bg-white rounded-xl border border-gray-200 p-6">
-              {step === "search" && (
+              {step === "upload" && (
                 <div>
                   <h2 className="text-lg font-semibold text-gray-900 mb-4">
-                    Search for People
+                    Upload Contact List
                   </h2>
-                  <SearchForm
-                    onSearch={handleSearch}
-                    isLoading={isSearching}
-                  />
-                  {searchError && (
-                    <div className="mt-3 p-3 bg-red-50 text-red-700 rounded-lg text-sm">
-                      {searchError}
+                  <FileUpload onContactsLoaded={handleContactsLoaded} />
+
+                  {contacts.length > 0 && (
+                    <div className="mt-6">
+                      <div className="flex items-center justify-between mb-4">
+                        <h3 className="font-medium text-gray-900">
+                          Contacts ({contacts.length})
+                        </h3>
+                        <div className="flex items-center gap-3">
+                          <span className="text-xs text-gray-500">
+                            {selectedIds.size} selected
+                          </span>
+                          <button
+                            onClick={() => setStep("compose")}
+                            disabled={selectedWithEmail === 0}
+                            className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                          >
+                            Compose Email
+                          </button>
+                        </div>
+                      </div>
+                      <ContactsTable
+                        contacts={contacts}
+                        selectedIds={selectedIds}
+                        onToggleSelect={handleToggleSelect}
+                        onSelectAll={handleSelectAll}
+                        onUpdateContact={handleUpdateContact}
+                        onRemoveContact={handleRemoveContact}
+                      />
                     </div>
                   )}
                 </div>
               )}
 
-              {step === "review" && (
-                <div>
-                  <div className="flex items-center justify-between mb-4">
-                    <h2 className="text-lg font-semibold text-gray-900">
-                      People List
-                      {currentListName && (
-                        <span className="text-sm font-normal text-gray-500 ml-2">
-                          ({currentListName})
-                        </span>
-                      )}
-                    </h2>
-                    <div className="flex items-center gap-3 text-sm text-gray-500">
-                      <span>
-                        {selectedIds.size} of {people.length} selected
-                      </span>
-                      <button
-                        onClick={() => setStep("email")}
-                        disabled={selectedIds.size === 0}
-                        className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
-                      >
-                        Compose Emails
-                      </button>
-                    </div>
-                  </div>
-                  <PeopleTable
-                    people={people}
-                    selectedIds={selectedIds}
-                    onToggleSelect={handleToggleSelect}
-                    onSelectAll={handleSelectAll}
-                    onUpdatePerson={handleUpdatePerson}
-                  />
-                </div>
-              )}
-
-              {step === "email" && (
+              {step === "compose" && (
                 <div>
                   <h2 className="text-lg font-semibold text-gray-900 mb-4">
                     Compose Email Template
                   </h2>
                   <EmailComposer
-                    people={people}
+                    contacts={contacts}
                     selectedIds={selectedIds}
                     onDraftsReady={handleDraftsReady}
                   />
@@ -294,17 +257,18 @@ export default function Home() {
 
           {/* Sidebar */}
           <div className="space-y-6">
-            <div className="bg-white rounded-xl border border-gray-200 p-4">
-              <h3 className="font-medium text-gray-900 mb-3">
-                Save / Load Lists
-              </h3>
-              <SaveLoadList
-                people={people}
-                onLoadPeople={handleLoadPeople}
-              />
-            </div>
+            {contacts.length > 0 && (
+              <div className="bg-white rounded-xl border border-gray-200 p-4">
+                <h3 className="font-medium text-gray-900 mb-2">Summary</h3>
+                <div className="space-y-1 text-sm text-gray-600">
+                  <p>{contacts.length} contacts loaded</p>
+                  <p>{selectedIds.size} selected</p>
+                  <p>{selectedWithEmail} with email addresses</p>
+                </div>
+              </div>
+            )}
 
-            {gmailTokens && (
+            {gmailTokens ? (
               <div className="bg-white rounded-xl border border-gray-200 p-4">
                 <div className="flex items-center gap-2">
                   <span className="w-2 h-2 bg-green-500 rounded-full"></span>
@@ -322,6 +286,18 @@ export default function Home() {
                   className="text-xs text-red-500 hover:underline mt-1"
                 >
                   Disconnect
+                </button>
+              </div>
+            ) : (
+              <div className="bg-white rounded-xl border border-gray-200 p-4">
+                <p className="text-sm text-gray-600 mb-2">
+                  Connect Gmail to create drafts
+                </p>
+                <button
+                  onClick={handleConnectGmail}
+                  className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 transition-colors"
+                >
+                  Connect Gmail
                 </button>
               </div>
             )}

@@ -26,14 +26,14 @@ export async function POST(request: NextRequest) {
           draft.body
         );
         results.push({
-          personId: draft.personId,
+          contactId: draft.contactId,
           draftId: result.id,
           to: draft.to,
           success: true,
         });
       } catch (error) {
         errors.push({
-          personId: draft.personId,
+          contactId: draft.contactId,
           to: draft.to,
           error: error instanceof Error ? error.message : "Failed to create draft",
         });
