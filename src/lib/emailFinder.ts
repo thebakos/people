@@ -1,62 +1,89 @@
+import { searchDuckDuckGo } from "./duckduckgo";
+
+const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+
+const BLOCKED_PATTERNS = [
+  "example.com",
+  "noreply",
+  "no-reply",
+  "support@",
+  "info@",
+  "contact@",
+  "help@",
+  "sales@",
+  "admin@",
+  "webmaster@",
+  "privacy@",
+  "legal@",
+  "abuse@",
+  "sentry.io",
+  "email.com",
+  "test.com",
+  "domain.com",
+  "company.com",
+  "yourcompany",
+  "placeholder",
+];
+
 /**
- * Search for a person's email using Google Custom Search API.
- * Searches public web pages for email addresses associated with the person.
+ * Search for a person's email address using DuckDuckGo (free, no API key).
+ * Looks through search result snippets for email patterns.
  */
-export async function searchEmailViaGoogle(
+export async function findEmail(
   name: string,
   company: string
 ): Promise<string | null> {
-  const apiKey = process.env.GOOGLE_API_KEY;
-  const searchEngineId = process.env.GOOGLE_SEARCH_ENGINE_ID;
-
-  if (!apiKey || !searchEngineId) {
-    return null;
-  }
-
+  // Try a direct email search first
   const query = `"${name}" "${company}" email`;
-  const params = new URLSearchParams({
-    key: apiKey,
-    cx: searchEngineId,
-    q: query,
-    num: "5",
-  });
+  const results = await searchDuckDuckGo(query);
 
-  try {
-    const response = await fetch(
-      `https://www.googleapis.com/customsearch/v1?${params}`
-    );
+  const foundEmails: string[] = [];
 
-    if (!response.ok) {
-      console.error(`Google Search API error: ${response.status}`);
-      return null;
-    }
+  for (const result of results) {
+    const text = `${result.title} ${result.snippet}`;
+    const matches = text.match(EMAIL_REGEX) || [];
 
-    const data = await response.json();
-    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-    const foundEmails: string[] = [];
-
-    for (const item of data.items || []) {
-      const text = `${item.title || ""} ${item.snippet || ""}`;
-      const matches = text.match(emailRegex) || [];
-      for (const email of matches) {
-        const lower = email.toLowerCase();
-        // Filter out common generic/spam addresses
-        if (
-          !lower.includes("example.com") &&
-          !lower.includes("noreply") &&
-          !lower.includes("no-reply") &&
-          !lower.includes("support@") &&
-          !lower.includes("info@") &&
-          !lower.includes("contact@")
-        ) {
-          foundEmails.push(lower);
-        }
+    for (const email of matches) {
+      const lower = email.toLowerCase();
+      if (isValidEmail(lower, name)) {
+        foundEmails.push(lower);
       }
     }
-
-    return foundEmails.length > 0 ? foundEmails[0] : null;
-  } catch (error) {
-    console.error("Google Search email lookup failed:", error);
-    return null;
   }
+
+  if (foundEmails.length > 0) {
+    // Prefer emails that contain part of the person's name
+    const nameParts = name.toLowerCase().split(/\s+/);
+    const nameMatch = foundEmails.find((e) =>
+      nameParts.some((part) => part.length > 2 && e.includes(part))
+    );
+    return nameMatch || foundEmails[0];
+  }
+
+  return null;
+}
+
+/**
+ * Check if an email looks valid and isn't a generic/spam address.
+ */
+function isValidEmail(email: string, name: string): boolean {
+  // Check against blocked patterns
+  for (const pattern of BLOCKED_PATTERNS) {
+    if (email.includes(pattern)) {
+      return false;
+    }
+  }
+
+  // Filter out clearly fake/generic patterns
+  if (email.startsWith("...") || email.includes("...")) {
+    return false;
+  }
+
+  // Must have a reasonable TLD
+  const tld = email.split(".").pop() || "";
+  if (tld.length < 2 || tld.length > 10) {
+    return false;
+  }
+
+  return true;
 }
