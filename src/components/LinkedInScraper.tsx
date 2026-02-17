@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { ScraperResult, CompanySearchStatus, Contact } from "@/lib/types";
 import { v4 as uuidv4 } from "uuid";
 
@@ -12,12 +12,30 @@ export default function LinkedInScraper({
   onContactsFound,
 }: LinkedInScraperProps) {
   const [urlInput, setUrlInput] = useState("");
+  const [linkedinCookie, setLinkedinCookie] = useState("");
+  const [showCookieInput, setShowCookieInput] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [companyStatuses, setCompanyStatuses] = useState<
     CompanySearchStatus[]
   >([]);
   const [allResults, setAllResults] = useState<ScraperResult[]>([]);
   const [error, setError] = useState("");
+
+  // Restore cookie from sessionStorage
+  useEffect(() => {
+    const stored = sessionStorage.getItem("linkedin_cookie");
+    if (stored) {
+      setLinkedinCookie(stored);
+      setShowCookieInput(true);
+    }
+  }, []);
+
+  // Save cookie to sessionStorage when it changes
+  useEffect(() => {
+    if (linkedinCookie) {
+      sessionStorage.setItem("linkedin_cookie", linkedinCookie);
+    }
+  }, [linkedinCookie]);
 
   const parseUrls = (input: string): string[] => {
     return input
@@ -78,7 +96,10 @@ export default function LinkedInScraper({
         const response = await fetch("/api/scraper/search", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url }),
+          body: JSON.stringify({
+            url,
+            linkedinCookie: linkedinCookie || undefined,
+          }),
         });
 
         const data = await response.json();
@@ -122,7 +143,7 @@ export default function LinkedInScraper({
     }
 
     setIsSearching(false);
-  }, [urlInput]);
+  }, [urlInput, linkedinCookie]);
 
   const handleDownloadCSV = useCallback(() => {
     if (allResults.length === 0) return;
@@ -166,6 +187,74 @@ export default function LinkedInScraper({
 
   return (
     <div>
+      {/* LinkedIn Authentication */}
+      <div className="mb-4">
+        <button
+          type="button"
+          onClick={() => setShowCookieInput(!showCookieInput)}
+          className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors w-full text-left ${
+            linkedinCookie
+              ? "bg-green-50 text-green-700 border border-green-200"
+              : "bg-amber-50 text-amber-700 border border-amber-200"
+          }`}
+        >
+          <span className={`w-2 h-2 rounded-full ${linkedinCookie ? "bg-green-500" : "bg-amber-500"}`} />
+          {linkedinCookie
+            ? "LinkedIn connected"
+            : "Connect LinkedIn for better results"}
+          <svg
+            className={`w-4 h-4 ml-auto transition-transform ${showCookieInput ? "rotate-180" : ""}`}
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+
+        {showCookieInput && (
+          <div className="mt-2 p-3 bg-gray-50 rounded-lg border border-gray-200">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              LinkedIn Session Cookie (li_at)
+            </label>
+            <input
+              type="password"
+              value={linkedinCookie}
+              onChange={(e) => setLinkedinCookie(e.target.value.trim())}
+              placeholder="Paste your li_at cookie value here..."
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            />
+            <details className="mt-2">
+              <summary className="text-xs text-blue-600 cursor-pointer hover:text-blue-700">
+                How to get your li_at cookie
+              </summary>
+              <ol className="mt-1.5 text-xs text-gray-600 space-y-1 list-decimal list-inside">
+                <li>Log in to LinkedIn in your browser</li>
+                <li>Open DevTools (F12 or Cmd+Opt+I)</li>
+                <li>Go to Application tab &rarr; Cookies &rarr; linkedin.com</li>
+                <li>Find the cookie named <code className="bg-gray-200 px-1 rounded">li_at</code></li>
+                <li>Copy the value and paste it above</li>
+              </ol>
+              <p className="mt-1.5 text-xs text-gray-500">
+                Your cookie is only sent to LinkedIn and is stored in your browser session. It is never saved to any server.
+              </p>
+            </details>
+            {linkedinCookie && (
+              <button
+                onClick={() => {
+                  setLinkedinCookie("");
+                  sessionStorage.removeItem("linkedin_cookie");
+                }}
+                className="mt-2 text-xs text-red-500 hover:underline"
+              >
+                Clear cookie
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* URL Input */}
       <div className="mb-4">
         <label
           htmlFor="linkedin-urls"
@@ -183,8 +272,8 @@ export default function LinkedInScraper({
           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none disabled:bg-gray-50 disabled:text-gray-400"
         />
         <p className="text-xs text-gray-500 mt-1">
-          Enter one URL per line. Finds up to 5 investment professionals per
-          company.
+          Enter one URL per line. Finds up to 10 employees per company
+          {linkedinCookie ? "" : " (connect LinkedIn above for best results)"}.
         </p>
       </div>
 
