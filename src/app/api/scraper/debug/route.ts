@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getCompanyInfo, searchCompanyEmployees } from "@/lib/linkedinApi";
 
 /**
  * Debug endpoint to test LinkedIn API connectivity and see raw responses.
@@ -25,122 +26,139 @@ export async function POST(request: NextRequest) {
 
   const steps: Record<string, unknown> = {};
 
-  // Step 1: Test basic auth by fetching own profile
+  // Step 1: Test basic auth
   try {
-    const meUrl = "https://www.linkedin.com/voyager/api/me";
-    const meRes = await fetch(meUrl, { headers });
-    steps["step1_auth_test"] = {
-      url: meUrl,
-      status: meRes.status,
-      statusText: meRes.statusText,
-      ok: meRes.ok,
-    };
-    if (meRes.ok) {
-      const meData = await meRes.json();
-      steps["step1_profile"] = {
-        firstName: meData?.miniProfile?.firstName || meData?.firstName,
-        lastName: meData?.miniProfile?.lastName || meData?.lastName,
-        keys: Object.keys(meData || {}),
-      };
-    } else {
-      const text = await meRes.text();
-      steps["step1_error"] = text.substring(0, 500);
-    }
+    const meRes = await fetch("https://www.linkedin.com/voyager/api/me", { headers });
+    steps["step1_auth"] = { status: meRes.status, ok: meRes.ok };
   } catch (e) {
     steps["step1_error"] = String(e);
   }
 
-  // Step 2: Try company lookup
+  // Step 2: Company lookup using our actual function
+  let companyId = "";
   try {
-    const companyUrl1 = `https://www.linkedin.com/voyager/api/organization/companies?decorationId=com.linkedin.voyager.deco.organization.web.WebFullCompanyMain-12&q=universalName&universalName=${encodeURIComponent(slug)}`;
-    const compRes1 = await fetch(companyUrl1, { headers });
-    steps["step2a_company_v1"] = {
-      url: companyUrl1,
-      status: compRes1.status,
-      ok: compRes1.ok,
+    const info = await getCompanyInfo(
+      companyUrl || `https://www.linkedin.com/company/${slug}`,
+      linkedinCookie
+    );
+    companyId = info.companyId;
+    steps["step2_company"] = {
+      companyName: info.companyName,
+      companyId: info.companyId,
     };
-    if (compRes1.ok) {
-      const data = await compRes1.json();
-      steps["step2a_data"] = {
-        topKeys: Object.keys(data || {}),
-        elementsCount: data?.elements?.length || 0,
-        includedCount: data?.included?.length || 0,
-        firstElement: data?.elements?.[0] ? {
-          type: data.elements[0].$type,
-          entityUrn: data.elements[0].entityUrn,
-          name: data.elements[0].name,
-          universalName: data.elements[0].universalName,
-          keys: Object.keys(data.elements[0]),
-        } : null,
-        firstIncluded: data?.included?.[0] ? {
-          type: data.included[0].$type,
-          entityUrn: data.included[0].entityUrn,
-          name: data.included[0].name,
-          keys: Object.keys(data.included[0]),
-        } : null,
-      };
-    } else {
-      const text = await compRes1.text();
-      steps["step2a_error"] = text.substring(0, 500);
-    }
   } catch (e) {
-    steps["step2a_error"] = String(e);
+    steps["step2_error"] = String(e);
   }
 
-  // Step 2b: Try alternate company endpoint
-  try {
-    const companyUrl2 = `https://www.linkedin.com/voyager/api/entities/companies/${encodeURIComponent(slug)}`;
-    const compRes2 = await fetch(companyUrl2, { headers });
-    steps["step2b_company_v2"] = {
-      url: companyUrl2,
-      status: compRes2.status,
-      ok: compRes2.ok,
-    };
-    if (compRes2.ok) {
-      const data = await compRes2.json();
-      steps["step2b_data"] = {
-        topKeys: Object.keys(data || {}),
-        entityUrn: data?.entityUrn,
-        name: data?.name,
-      };
+  // Step 3: Test search endpoints directly
+  if (companyId) {
+    // 3a: search/dash/clusters with different decorationIds
+    const decorationIds = [
+      "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186",
+      "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-185",
+      "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165",
+    ];
+
+    for (let i = 0; i < decorationIds.length; i++) {
+      try {
+        const params = new URLSearchParams({
+          decorationId: decorationIds[i],
+          origin: "COMPANY_PAGE_CANNED_SEARCH",
+          q: "all",
+          query: `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
+          start: "0",
+          count: "5",
+        });
+        const url = `https://www.linkedin.com/voyager/api/search/dash/clusters?${params}`;
+        const res = await fetch(url, { headers });
+        const key = `step3a_clusters_v${i}`;
+        steps[key] = { status: res.status, ok: res.ok, decorationId: decorationIds[i] };
+
+        if (res.ok) {
+          const json = await res.json();
+          const included = (json.included || []) as Record<string, unknown>[];
+          const types = [...new Set(included.map((e: Record<string, unknown>) => String(e.$type || "unknown")))];
+          const profiles = included.filter((e: Record<string, unknown>) => {
+            const t = String(e.$type || "");
+            const u = String(e.entityUrn || "");
+            return t.includes("MiniProfile") || t.includes("Profile") || u.includes("fsd_profile") || u.includes("fs_miniProfile");
+          });
+          steps[key + "_data"] = {
+            topKeys: Object.keys(json),
+            includedCount: included.length,
+            entityTypes: types,
+            profileCount: profiles.length,
+            sampleProfile: profiles[0] ? {
+              $type: profiles[0].$type,
+              entityUrn: profiles[0].entityUrn,
+              firstName: profiles[0].firstName,
+              lastName: profiles[0].lastName,
+              publicIdentifier: profiles[0].publicIdentifier,
+              headline: profiles[0].headline,
+              occupation: profiles[0].occupation,
+              keys: Object.keys(profiles[0]),
+            } : null,
+          };
+          if (profiles.length > 0) break; // Found profiles, skip remaining decorationIds
+        } else {
+          const text = await res.text();
+          steps[key + "_error"] = text.substring(0, 300);
+        }
+      } catch (e) {
+        steps[`step3a_clusters_v${i}_error`] = String(e);
+      }
     }
-  } catch (e) {
-    steps["step2b_error"] = String(e);
+
+    // 3b: search/blended
+    try {
+      const params = new URLSearchParams({
+        count: "5",
+        filters: `List(currentCompany->${companyId},resultType->PEOPLE)`,
+        origin: "COMPANY_PAGE_CANNED_SEARCH",
+        q: "all",
+        start: "0",
+      });
+      const url = `https://www.linkedin.com/voyager/api/search/blended?${params}`;
+      const res = await fetch(url, { headers });
+      steps["step3b_blended"] = { status: res.status, ok: res.ok };
+
+      if (res.ok) {
+        const json = await res.json();
+        const included = (json.included || []) as Record<string, unknown>[];
+        const types = [...new Set(included.map((e: Record<string, unknown>) => String(e.$type || "unknown")))];
+        const profiles = included.filter((e: Record<string, unknown>) => {
+          const t = String(e.$type || "");
+          return t.includes("MiniProfile") || t.includes("Profile");
+        });
+        steps["step3b_blended_data"] = {
+          topKeys: Object.keys(json),
+          includedCount: included.length,
+          entityTypes: types,
+          profileCount: profiles.length,
+          sampleProfile: profiles[0] ? {
+            $type: profiles[0].$type,
+            firstName: profiles[0].firstName,
+            lastName: profiles[0].lastName,
+            publicIdentifier: profiles[0].publicIdentifier,
+            keys: Object.keys(profiles[0]),
+          } : null,
+        };
+      }
+    } catch (e) {
+      steps["step3b_error"] = String(e);
+    }
+
+    // Step 4: Full end-to-end test using our actual search function
+    try {
+      const employees = await searchCompanyEmployees(companyId, linkedinCookie, 5);
+      steps["step4_final_result"] = {
+        employeeCount: employees.length,
+        employees: employees.map(e => ({ name: e.name, headline: e.headline, url: e.linkedinUrl })),
+      };
+    } catch (e) {
+      steps["step4_error"] = String(e);
+    }
   }
 
-  // Step 2c: Try organization API
-  try {
-    const companyUrl3 = `https://www.linkedin.com/voyager/api/organization/companies?q=universalName&universalName=${encodeURIComponent(slug)}`;
-    const compRes3 = await fetch(companyUrl3, { headers });
-    steps["step2c_company_v3"] = {
-      url: companyUrl3,
-      status: compRes3.status,
-      ok: compRes3.ok,
-    };
-    if (compRes3.ok) {
-      const data = await compRes3.json();
-      steps["step2c_data"] = {
-        topKeys: Object.keys(data || {}),
-        elementsCount: data?.elements?.length || 0,
-        includedCount: data?.included?.length || 0,
-        sampleElement: data?.elements?.[0] ? summarizeEntity(data.elements[0]) : null,
-        sampleIncluded: data?.included?.slice(0, 3).map(summarizeEntity),
-      };
-    }
-  } catch (e) {
-    steps["step2c_error"] = String(e);
-  }
-
-  return NextResponse.json({ slug, steps });
-}
-
-function summarizeEntity(entity: Record<string, unknown>): Record<string, unknown> {
-  return {
-    $type: entity.$type,
-    entityUrn: entity.entityUrn,
-    $id: entity["$id"],
-    name: entity.name,
-    universalName: entity.universalName,
-    keys: Object.keys(entity),
-  };
+  return NextResponse.json({ slug, companyId, steps });
 }

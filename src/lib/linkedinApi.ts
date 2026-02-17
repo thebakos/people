@@ -10,8 +10,6 @@ interface LinkedInEmployee {
 
 /**
  * Build the required headers for LinkedIn Voyager API requests.
- * The li_at cookie is used for authentication. A matching JSESSIONID
- * cookie and Csrf-Token header are required.
  */
 function buildHeaders(liAtCookie: string): Record<string, string> {
   const csrfToken = `ajax:${Date.now()}`;
@@ -27,7 +25,6 @@ function buildHeaders(liAtCookie: string): Record<string, string> {
 
 /**
  * Extract the company slug from a LinkedIn company URL.
- * e.g. "https://www.linkedin.com/company/sequoia-capital" → "sequoia-capital"
  */
 function extractCompanySlug(url: string): string {
   const match = url.match(/linkedin\.com\/company\/([^/?#]+)/);
@@ -36,6 +33,7 @@ function extractCompanySlug(url: string): string {
 
 /**
  * Get company info (name + numeric ID) from LinkedIn using the Voyager API.
+ * The response uses { data, included } format where entities are in `included`.
  */
 export async function getCompanyInfo(
   companyUrl: string,
@@ -58,54 +56,83 @@ export async function getCompanyInfo(
         "LinkedIn authentication failed. Your session cookie may have expired."
       );
     }
-    throw new Error(`LinkedIn API error: ${response.status}`);
+    throw new Error(`LinkedIn company lookup error: ${response.status}`);
   }
 
-  const data = await response.json();
+  const json = await response.json();
 
-  // Extract company name and ID from the response
+  // Voyager API returns { data: ..., included: [...entities...] }
+  const included = (json.included || []) as Record<string, unknown>[];
+  const dataObj = json.data as Record<string, unknown> | undefined;
+
   let companyName = slug
     .replace(/-/g, " ")
     .replace(/\b\w/g, (c) => c.toUpperCase());
   let companyId = "";
 
-  // The response includes elements in the "included" array
-  const elements = data.elements || [];
-  const included = data.included || [];
+  // Strategy 1: Look for company URN in any included entity's entityUrn
+  for (const entity of included) {
+    const entityUrn = String(entity.entityUrn || "");
 
-  // Try to find company data in elements first, then included
-  const allEntities = [...elements, ...included];
-
-  for (const entity of allEntities) {
-    // Look for the company entity
+    // Match company entities directly
+    const type = String(entity.$type || "");
     if (
-      entity.$type === "com.linkedin.voyager.organization.Company" ||
-      entity.universalName === slug
+      type.includes("organization.Company") ||
+      type.includes("organization.Organization") ||
+      (entity.universalName && entity.universalName === slug)
     ) {
-      if (entity.name) {
-        companyName = entity.name;
-      }
-      // The entityUrn contains the numeric ID: "urn:li:fs_normalized_company:12345"
-      const urn = entity.entityUrn || entity["*companyV2"] || "";
-      const idMatch = urn.match(/(\d+)$/);
+      if (entity.name) companyName = String(entity.name);
+      const idMatch = entityUrn.match(/(?:company|fs_normalized_company):(\d+)/);
       if (idMatch) {
         companyId = idMatch[1];
+        break;
       }
-      break;
     }
   }
 
-  // Fallback: search for any entity with a numeric company ID
+  // Strategy 2: Extract company ID from FollowingInfo or any URN containing company:<id>
   if (!companyId) {
-    for (const entity of allEntities) {
-      const urn =
-        entity.entityUrn || entity.objectUrn || entity["$id"] || "";
-      const idMatch = urn.match(
-        /(?:company|organization|fs_normalized_company):(\d+)/
-      );
+    for (const entity of included) {
+      const entityUrn = String(entity.entityUrn || "");
+      const idMatch = entityUrn.match(/urn:li:company:(\d+)/);
       if (idMatch) {
         companyId = idMatch[1];
-        if (entity.name) companyName = entity.name;
+        // Try to find the name from this or nearby entities
+        if (entity.name) companyName = String(entity.name);
+        break;
+      }
+    }
+  }
+
+  // Strategy 3: Search all string values in included entities for company IDs
+  if (!companyId) {
+    for (const entity of included) {
+      for (const value of Object.values(entity)) {
+        const str = String(value || "");
+        const idMatch = str.match(/(?:company|fs_normalized_company|fs_miniCompany):(\d+)/);
+        if (idMatch) {
+          companyId = idMatch[1];
+          break;
+        }
+      }
+      if (companyId) break;
+    }
+  }
+
+  // Strategy 4: Check the data object itself
+  if (!companyId && dataObj) {
+    const dataStr = JSON.stringify(dataObj);
+    const idMatch = dataStr.match(/urn:li:(?:company|fs_normalized_company|fsd_company):(\d+)/);
+    if (idMatch) {
+      companyId = idMatch[1];
+    }
+  }
+
+  // Also try to get company name from included entities if we haven't found it
+  if (companyId && companyName === slug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())) {
+    for (const entity of included) {
+      if (entity.name && String(entity.entityUrn || "").includes(companyId)) {
+        companyName = String(entity.name);
         break;
       }
     }
@@ -113,7 +140,7 @@ export async function getCompanyInfo(
 
   if (!companyId) {
     throw new Error(
-      `Could not find company ID for "${slug}". The company may not exist on LinkedIn.`
+      `Could not find company ID for "${slug}". Got ${included.length} included entities but no company URN found.`
     );
   }
 
@@ -122,7 +149,6 @@ export async function getCompanyInfo(
 
 /**
  * Search for employees at a company using LinkedIn's Voyager search API.
- * Targets investment professionals (partners, directors, etc.).
  */
 export async function searchCompanyEmployees(
   companyId: string,
@@ -131,131 +157,165 @@ export async function searchCompanyEmployees(
 ): Promise<LinkedInEmployee[]> {
   const headers = buildHeaders(liAtCookie);
 
-  // Use LinkedIn's people search filtered by current company
-  const queryParams = new URLSearchParams({
-    decorationId:
-      "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186",
-    origin: "COMPANY_PAGE_CANNED_SEARCH",
-    q: "all",
-    query: `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
-    start: "0",
-    count: String(Math.min(limit, 49)),
-  });
+  // Try the search/dash/clusters endpoint first (newer format)
+  const employees = await trySearchDashClusters(companyId, headers, limit);
+  if (employees.length > 0) return employees;
 
-  const url = `${LINKEDIN_API_BASE}/search/dash/clusters?${queryParams.toString()}`;
+  // Fallback: try the search/blended endpoint
+  return trySearchBlended(companyId, headers, limit);
+}
 
-  const response = await fetch(url, { headers });
+async function trySearchDashClusters(
+  companyId: string,
+  headers: Record<string, string>,
+  limit: number
+): Promise<LinkedInEmployee[]> {
+  // Try multiple decorationId versions as LinkedIn updates these
+  const decorationIds = [
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186",
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-185",
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165",
+  ];
 
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      throw new Error("LinkedIn authentication failed.");
+  for (const decorationId of decorationIds) {
+    try {
+      const queryParams = new URLSearchParams({
+        decorationId,
+        origin: "COMPANY_PAGE_CANNED_SEARCH",
+        q: "all",
+        query: `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
+        start: "0",
+        count: String(Math.min(limit, 49)),
+      });
+
+      const url = `${LINKEDIN_API_BASE}/search/dash/clusters?${queryParams.toString()}`;
+      const response = await fetch(url, { headers });
+
+      if (!response.ok) continue;
+
+      const json = await response.json();
+      const employees = parseSearchResults(json, limit);
+      if (employees.length > 0) return employees;
+    } catch {
+      continue;
     }
-    throw new Error(`LinkedIn search API error: ${response.status}`);
   }
 
-  const data = await response.json();
-  return parseSearchResults(data, limit);
+  return [];
+}
+
+async function trySearchBlended(
+  companyId: string,
+  headers: Record<string, string>,
+  limit: number
+): Promise<LinkedInEmployee[]> {
+  try {
+    const queryParams = new URLSearchParams({
+      count: String(Math.min(limit, 49)),
+      filters: `List(currentCompany->${companyId},resultType->PEOPLE)`,
+      origin: "COMPANY_PAGE_CANNED_SEARCH",
+      q: "all",
+      start: "0",
+    });
+
+    const url = `${LINKEDIN_API_BASE}/search/blended?${queryParams.toString()}`;
+    const response = await fetch(url, { headers });
+
+    if (!response.ok) return [];
+
+    const json = await response.json();
+    return parseSearchResults(json, limit);
+  } catch {
+    return [];
+  }
 }
 
 /**
  * Parse LinkedIn search API response to extract employee info.
+ * Handles both { data, included } and { elements, included } formats.
  */
 function parseSearchResults(
-  data: Record<string, unknown>,
+  json: Record<string, unknown>,
   limit: number
 ): LinkedInEmployee[] {
   const employees: LinkedInEmployee[] = [];
-  const included = (data.included || []) as Record<string, unknown>[];
 
-  // Build a map of entity URNs to their data for quick lookup
-  const entityMap = new Map<string, Record<string, unknown>>();
-  for (const entity of included) {
-    const id =
-      (entity.entityUrn as string) ||
-      (entity["$id"] as string) ||
-      (entity["*profile"] as string) ||
-      "";
-    if (id) {
-      entityMap.set(id, entity);
-    }
-  }
+  // Get all entities from the response
+  const included = (json.included || []) as Record<string, unknown>[];
 
-  // Look for profile entities in the included array
+  // Look for profile/mini-profile entities
   for (const entity of included) {
     if (employees.length >= limit) break;
 
-    const type = entity.$type as string;
-    const entityUrn = (entity.entityUrn as string) || "";
+    const type = String(entity.$type || "");
+    const entityUrn = String(entity.entityUrn || "");
 
-    // Match mini-profile entities
-    if (
-      type === "com.linkedin.voyager.identity.shared.MiniProfile" ||
-      type === "com.linkedin.voyager.dash.identity.profile.Profile" ||
+    // Match profile entities
+    const isProfile =
+      type.includes("MiniProfile") ||
+      type.includes("identity.profile.Profile") ||
+      type.includes("identity.shared.MiniProfile") ||
       entityUrn.includes("fs_miniProfile") ||
-      entityUrn.includes("fsd_profile")
-    ) {
-      const firstName = (entity.firstName as string) || "";
-      const lastName = (entity.lastName as string) || "";
-      const name = `${firstName} ${lastName}`.trim();
+      entityUrn.includes("fsd_profile");
 
-      if (!name || name === "LinkedIn Member") continue;
+    if (!isProfile) continue;
 
-      const occupation = (entity.occupation as string) || "";
-      const headline = (entity.headline as string) || occupation;
+    const firstName = String(entity.firstName || "");
+    const lastName = String(entity.lastName || "");
+    const name = `${firstName} ${lastName}`.trim();
 
-      // Build profile URL from publicIdentifier
-      const publicId = (entity.publicIdentifier as string) || "";
-      const linkedinUrl = publicId
-        ? `https://www.linkedin.com/in/${publicId}`
-        : "";
+    if (!name || name === "LinkedIn Member") continue;
 
-      if (!linkedinUrl) continue;
+    const occupation = String(entity.occupation || "");
+    const headline = String(entity.headline || occupation || "");
 
-      // Check for duplicates
-      if (employees.some((e) => e.linkedinUrl === linkedinUrl)) continue;
+    const publicId = String(entity.publicIdentifier || "");
+    if (!publicId) continue;
 
-      employees.push({ name, headline, linkedinUrl });
-    }
+    const linkedinUrl = `https://www.linkedin.com/in/${publicId}`;
+
+    if (employees.some((e) => e.linkedinUrl === linkedinUrl)) continue;
+
+    employees.push({ name, headline, linkedinUrl });
   }
 
-  // If we didn't find profiles in the standard way, try alternative parsing
+  // Fallback: look for EntityResultViewModel entities (newer search format)
   if (employees.length === 0) {
     for (const entity of included) {
       if (employees.length >= limit) break;
 
-      // Look for search result entities that reference profiles
-      const type = entity.$type as string;
+      const type = String(entity.$type || "");
       if (
-        type ===
-          "com.linkedin.voyager.dash.search.EntityResultViewModel" ||
-        type === "com.linkedin.voyager.search.SearchHitV2"
+        !type.includes("EntityResultViewModel") &&
+        !type.includes("SearchHitV2") &&
+        !type.includes("EntityResult")
       ) {
-        const title = entity.title as
-          | { text?: string }
-          | undefined;
-        const name = title?.text || "";
-        if (!name || name === "LinkedIn Member") continue;
-
-        const summary = entity.primarySubtitle as
-          | { text?: string }
-          | undefined;
-        const headline = summary?.text || "";
-
-        // Try to extract profile URL
-        const navUrl = (entity.navigationUrl as string) || "";
-        const profileMatch = navUrl.match(
-          /linkedin\.com\/in\/([^/?#]+)/
-        );
-        const linkedinUrl = profileMatch
-          ? `https://www.linkedin.com/in/${profileMatch[1]}`
-          : "";
-
-        if (!linkedinUrl) continue;
-        if (employees.some((e) => e.linkedinUrl === linkedinUrl))
-          continue;
-
-        employees.push({ name, headline, linkedinUrl });
+        continue;
       }
+
+      // Extract name from title
+      const title = entity.title as { text?: string } | undefined;
+      const name = title?.text || "";
+      if (!name || name === "LinkedIn Member") continue;
+
+      const summary = entity.primarySubtitle as { text?: string } | undefined;
+      const headline = summary?.text || "";
+
+      // Extract profile URL from navigationUrl or navigationContext
+      let profileUrl = "";
+      const navUrl = String(entity.navigationUrl || "");
+      const navCtx = entity.navigationContext as { url?: string } | undefined;
+      const rawUrl = navUrl || navCtx?.url || "";
+
+      const profileMatch = rawUrl.match(/linkedin\.com\/in\/([^/?#]+)/);
+      if (profileMatch) {
+        profileUrl = `https://www.linkedin.com/in/${profileMatch[1]}`;
+      }
+
+      if (!profileUrl) continue;
+      if (employees.some((e) => e.linkedinUrl === profileUrl)) continue;
+
+      employees.push({ name, headline, linkedinUrl: profileUrl });
     }
   }
 
@@ -264,7 +324,6 @@ function parseSearchResults(
 
 /**
  * High-level function: find employees at a LinkedIn company URL.
- * Uses the Voyager API with authentication.
  */
 export async function findCompanyEmployees(
   companyUrl: string,
@@ -274,16 +333,13 @@ export async function findCompanyEmployees(
   companyName: string;
   employees: LinkedInEmployee[];
 }> {
-  // Step 1: Get company info
   const { companyName, companyId } = await getCompanyInfo(
     companyUrl,
     liAtCookie
   );
 
-  // Brief delay between API calls
   await delay(500);
 
-  // Step 2: Search for employees
   const employees = await searchCompanyEmployees(
     companyId,
     liAtCookie,
