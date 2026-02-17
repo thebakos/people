@@ -6,11 +6,14 @@ import FileUpload from "@/components/FileUpload";
 import ContactsTable from "@/components/ContactsTable";
 import EmailComposer from "@/components/EmailComposer";
 import GmailConnect from "@/components/GmailConnect";
+import LinkedInScraper from "@/components/LinkedInScraper";
 
 type Step = "upload" | "compose" | "send";
+type InputMode = "linkedin" | "csv";
 
 export default function Home() {
   const [step, setStep] = useState<Step>("upload");
+  const [inputMode, setInputMode] = useState<InputMode>("linkedin");
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [drafts, setDrafts] = useState<DraftEmail[]>([]);
@@ -111,7 +114,7 @@ export default function Home() {
   };
 
   const steps: { key: Step; label: string; num: number }[] = [
-    { key: "upload", label: "Upload Contacts", num: 1 },
+    { key: "upload", label: "Find Contacts", num: 1 },
     { key: "compose", label: "Compose Email", num: 2 },
     { key: "send", label: "Create Drafts", num: 3 },
   ];
@@ -125,11 +128,11 @@ export default function Home() {
       <header className="bg-white border-b border-gray-200">
         <div className="max-w-5xl mx-auto px-4 py-4">
           <h1 className="text-xl font-bold text-gray-900">
-            Email Outreach
+            VC Contact Finder & Email Outreach
           </h1>
           <p className="text-sm text-gray-500 mt-0.5">
-            Upload contacts, compose a personalized email, and create Gmail
-            drafts
+            Find VC investment professionals from LinkedIn, get their emails,
+            and draft personalized outreach
           </p>
         </div>
       </header>
@@ -164,10 +167,49 @@ export default function Home() {
             <div className="bg-white rounded-xl border border-gray-200 p-6">
               {step === "upload" && (
                 <div>
-                  <h2 className="text-lg font-semibold text-gray-900 mb-4">
-                    Upload Contact List
-                  </h2>
-                  <FileUpload onContactsLoaded={handleContactsLoaded} />
+                  {/* Input mode toggle */}
+                  <div className="flex items-center gap-2 mb-4">
+                    <button
+                      onClick={() => setInputMode("linkedin")}
+                      className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                        inputMode === "linkedin"
+                          ? "bg-blue-100 text-blue-700 border border-blue-200"
+                          : "bg-gray-100 text-gray-600 hover:bg-gray-200 border border-transparent"
+                      }`}
+                    >
+                      Find from LinkedIn
+                    </button>
+                    <button
+                      onClick={() => setInputMode("csv")}
+                      className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                        inputMode === "csv"
+                          ? "bg-blue-100 text-blue-700 border border-blue-200"
+                          : "bg-gray-100 text-gray-600 hover:bg-gray-200 border border-transparent"
+                      }`}
+                    >
+                      Upload CSV
+                    </button>
+                  </div>
+
+                  {inputMode === "linkedin" && (
+                    <div>
+                      <h2 className="text-lg font-semibold text-gray-900 mb-4">
+                        Find VC Contacts from LinkedIn
+                      </h2>
+                      <LinkedInScraper
+                        onContactsFound={handleContactsLoaded}
+                      />
+                    </div>
+                  )}
+
+                  {inputMode === "csv" && (
+                    <div>
+                      <h2 className="text-lg font-semibold text-gray-900 mb-4">
+                        Upload Contact List
+                      </h2>
+                      <FileUpload onContactsLoaded={handleContactsLoaded} />
+                    </div>
+                  )}
 
                   {contacts.length > 0 && (
                     <div className="mt-6">
@@ -267,6 +309,21 @@ export default function Home() {
                 </div>
               </div>
             )}
+
+            <div className="bg-white rounded-xl border border-gray-200 p-4">
+              <h3 className="font-medium text-gray-900 mb-2">How it works</h3>
+              <ol className="space-y-1.5 text-sm text-gray-600 list-decimal list-inside">
+                <li>
+                  Paste VC company LinkedIn URLs
+                </li>
+                <li>
+                  We find investment managers &amp; their emails
+                </li>
+                <li>
+                  Download CSV or compose personalized outreach
+                </li>
+              </ol>
+            </div>
 
             {gmailTokens ? (
               <div className="bg-white rounded-xl border border-gray-200 p-4">

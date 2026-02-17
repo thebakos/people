@@ -22,3 +22,17 @@ export interface GmailTokens {
   refresh_token: string;
   expiry_date: number;
 }
+
+export interface ScraperResult {
+  companyName: string;
+  contactName: string;
+  linkedinUrl: string;
+  email: string;
+}
+
+export interface CompanySearchStatus {
+  url: string;
+  status: "pending" | "searching" | "done" | "error";
+  message?: string;
+  results: ScraperResult[];
+}
