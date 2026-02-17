@@ -9,19 +9,25 @@ interface LinkedInEmployee {
 }
 
 /**
- * Fetch a real JSESSIONID from LinkedIn by hitting the feed page.
- * LinkedIn validates that the CSRF token matches a server-issued JSESSIONID,
- * so we can't just fabricate one.
+ * Fetch a real JSESSIONID from LinkedIn.
+ * Uses a lightweight HEAD request with a timeout to avoid hanging.
+ * Falls back to null if it can't obtain one (will use ajax:timestamp instead).
  */
 async function fetchJSessionId(liAtCookie: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+
   try {
-    const res = await fetch("https://www.linkedin.com/feed/", {
+    // Use a HEAD request to the homepage — much lighter than fetching /feed/
+    const res = await fetch("https://www.linkedin.com/", {
+      method: "HEAD",
       headers: {
         Cookie: `li_at=${liAtCookie}`,
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
       redirect: "manual",
+      signal: controller.signal,
     });
 
     // Extract JSESSIONID from Set-Cookie headers
@@ -31,12 +37,14 @@ async function fetchJSessionId(liAtCookie: string): Promise<string | null> {
       if (match) return match[1];
     }
 
-    // Try raw header as fallback
+    // Try raw header as fallback (some runtimes merge set-cookie headers)
     const rawSetCookie = res.headers.get("set-cookie") || "";
     const match = rawSetCookie.match(/JSESSIONID="?([^";]+)"?/);
     if (match) return match[1];
   } catch {
-    // ignore
+    // Timeout or network error — fall back to generated token
+  } finally {
+    clearTimeout(timeout);
   }
   return null;
 }
@@ -80,12 +88,19 @@ export async function validateAuth(
   const token = jsessionId || `ajax:${Date.now()}`;
   const headers = buildHeaders(liAtCookie, token);
 
-  // Step 2: Test auth with /me endpoint
+  // Step 2: Test auth with /me endpoint (with timeout)
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch(`${LINKEDIN_API_BASE}/me`, { headers });
+    const res = await fetch(`${LINKEDIN_API_BASE}/me`, {
+      headers,
+      signal: controller.signal,
+    });
     return { jsessionId: token, valid: res.ok };
   } catch {
     return { jsessionId: token, valid: false };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
