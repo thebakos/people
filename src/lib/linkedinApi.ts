@@ -279,18 +279,22 @@ async function trySearchDashClusters(
     "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165",
   ];
 
+  const count = Math.min(limit, 49);
+
   for (const decorationId of decorationIds) {
     try {
-      const queryParams = new URLSearchParams({
-        decorationId,
-        origin: "COMPANY_PAGE_CANNED_SEARCH",
-        q: "all",
-        query: `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
-        start: "0",
-        count: String(Math.min(limit, 49)),
-      });
+      // IMPORTANT: Build URL manually — URLSearchParams encodes parentheses/colons
+      // which breaks LinkedIn's proprietary query format
+      const query = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
+      const url =
+        `${LINKEDIN_API_BASE}/search/dash/clusters` +
+        `?decorationId=${encodeURIComponent(decorationId)}` +
+        `&origin=COMPANY_PAGE_CANNED_SEARCH` +
+        `&q=all` +
+        `&query=${query}` +
+        `&start=0` +
+        `&count=${count}`;
 
-      const url = `${LINKEDIN_API_BASE}/search/dash/clusters?${queryParams.toString()}`;
       const response = await fetch(url, { headers });
 
       if (!response.ok) continue;
@@ -312,15 +316,16 @@ async function trySearchBlended(
   limit: number
 ): Promise<LinkedInEmployee[]> {
   try {
-    const queryParams = new URLSearchParams({
-      count: String(Math.min(limit, 49)),
-      filters: `List(currentCompany->${companyId},resultType->PEOPLE)`,
-      origin: "COMPANY_PAGE_CANNED_SEARCH",
-      q: "all",
-      start: "0",
-    });
+    const count = Math.min(limit, 49);
+    // Build URL manually to avoid encoding List() and -> syntax
+    const url =
+      `${LINKEDIN_API_BASE}/search/blended` +
+      `?count=${count}` +
+      `&filters=List(currentCompany->${companyId},resultType->PEOPLE)` +
+      `&origin=COMPANY_PAGE_CANNED_SEARCH` +
+      `&q=all` +
+      `&start=0`;
 
-    const url = `${LINKEDIN_API_BASE}/search/blended?${queryParams.toString()}`;
     const response = await fetch(url, { headers });
 
     if (!response.ok) return [];

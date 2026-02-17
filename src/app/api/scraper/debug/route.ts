@@ -57,7 +57,7 @@ export async function POST(request: NextRequest) {
     steps["step2_company_error"] = String(e);
   }
 
-  // Step 3: Raw search endpoint tests (to see exactly what LinkedIn returns)
+  // Step 3: Raw search endpoint tests
   if (companyId && authValid) {
     const csrfToken = jsessionId || `ajax:${Date.now()}`;
     const headers: Record<string, string> = {
@@ -69,51 +69,45 @@ export async function POST(request: NextRequest) {
       Accept: "application/vnd.linkedin.normalized+json+2.1",
     };
 
-    // 3a: search/dash/clusters
+    // 3a: search/dash/clusters — manually built URL (no URLSearchParams encoding)
     try {
-      const params = new URLSearchParams({
-        decorationId:
-          "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186",
-        origin: "COMPANY_PAGE_CANNED_SEARCH",
-        q: "all",
-        query: `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
-        start: "0",
-        count: "5",
-      });
-      const url = `https://www.linkedin.com/voyager/api/search/dash/clusters?${params}`;
+      const query = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
+      const decorationId = "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186";
+      const url =
+        `https://www.linkedin.com/voyager/api/search/dash/clusters` +
+        `?decorationId=${encodeURIComponent(decorationId)}` +
+        `&origin=COMPANY_PAGE_CANNED_SEARCH` +
+        `&q=all` +
+        `&query=${query}` +
+        `&start=0&count=5`;
+
       const res = await fetch(url, { headers });
       const resBody = await res.text();
 
       let parsed: Record<string, unknown> | null = null;
-      try {
-        parsed = JSON.parse(resBody);
-      } catch {
-        // not JSON
-      }
+      try { parsed = JSON.parse(resBody); } catch { /* not JSON */ }
 
       if (parsed) {
         const included = (parsed.included || []) as Record<string, unknown>[];
-        const types = [
-          ...new Set(
-            included.map((e) => String(e.$type || "unknown"))
-          ),
-        ];
+        const types = [...new Set(included.map((e) => String(e.$type || "unknown")))];
         steps["step3a_clusters"] = {
           status: res.status,
           ok: res.ok,
-          topKeys: Object.keys(parsed),
           includedCount: included.length,
           entityTypes: types,
-          firstThreeEntities: included.slice(0, 3).map((e) => ({
+          sampleEntities: included.slice(0, 3).map((e) => ({
             $type: e.$type,
             entityUrn: e.entityUrn,
+            firstName: e.firstName,
+            lastName: e.lastName,
+            publicIdentifier: e.publicIdentifier,
+            occupation: e.occupation,
             keys: Object.keys(e),
           })),
         };
       } else {
         steps["step3a_clusters"] = {
           status: res.status,
-          ok: res.ok,
           rawBody: resBody.substring(0, 500),
         };
       }
@@ -121,61 +115,33 @@ export async function POST(request: NextRequest) {
       steps["step3a_error"] = String(e);
     }
 
-    // 3b: search/blended
+    // 3b: search/blended — manually built URL
     try {
-      const params = new URLSearchParams({
-        count: "5",
-        filters: `List(currentCompany->${companyId},resultType->PEOPLE)`,
-        origin: "COMPANY_PAGE_CANNED_SEARCH",
-        q: "all",
-        start: "0",
-      });
-      const url = `https://www.linkedin.com/voyager/api/search/blended?${params}`;
+      const url =
+        `https://www.linkedin.com/voyager/api/search/blended` +
+        `?count=5` +
+        `&filters=List(currentCompany->${companyId},resultType->PEOPLE)` +
+        `&origin=COMPANY_PAGE_CANNED_SEARCH` +
+        `&q=all&start=0`;
+
       const res = await fetch(url, { headers });
-      const resBody = await res.text();
+      steps["step3b_blended"] = { status: res.status, ok: res.ok };
 
-      let parsed: Record<string, unknown> | null = null;
-      try {
-        parsed = JSON.parse(resBody);
-      } catch {
-        // not JSON
-      }
-
-      if (parsed) {
+      if (res.ok) {
+        const parsed = await res.json();
         const included = (parsed.included || []) as Record<string, unknown>[];
-        const elements = (parsed.elements || []) as Record<string, unknown>[];
-        const types = [
-          ...new Set(
-            included.map((e) => String(e.$type || "unknown"))
-          ),
-        ];
-        steps["step3b_blended"] = {
-          status: res.status,
-          ok: res.ok,
-          topKeys: Object.keys(parsed),
-          elementsCount: elements.length,
+        steps["step3b_blended_data"] = {
           includedCount: included.length,
-          entityTypes: types,
-          firstThreeIncluded: included.slice(0, 3).map((e) => ({
-            $type: e.$type,
-            entityUrn: e.entityUrn,
-            keys: Object.keys(e),
-          })),
-        };
-      } else {
-        steps["step3b_blended"] = {
-          status: res.status,
-          ok: res.ok,
-          rawBody: resBody.substring(0, 500),
+          entityTypes: [...new Set(included.map((e: Record<string, unknown>) => String(e.$type || "unknown")))],
         };
       }
     } catch (e) {
       steps["step3b_error"] = String(e);
     }
 
-    // 3c: graphql people search (alternative endpoint)
+    // 3c: graphql endpoint — variables as JSON in query param
     try {
-      const variables = JSON.stringify({
+      const variables = encodeURIComponent(JSON.stringify({
         start: 0,
         count: 5,
         origin: "COMPANY_PAGE_CANNED_SEARCH",
@@ -187,36 +153,25 @@ export async function POST(request: NextRequest) {
           },
           includeFiltersInResponse: false,
         },
-      });
-      const params = new URLSearchParams({
-        variables,
-        queryId: "voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0",
-      });
-      const url = `https://www.linkedin.com/voyager/api/graphql?${params}`;
+      }));
+      const queryId = "voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0";
+      const url = `https://www.linkedin.com/voyager/api/graphql?variables=${variables}&queryId=${encodeURIComponent(queryId)}`;
+
       const res = await fetch(url, { headers });
       const resBody = await res.text();
 
       let parsed: Record<string, unknown> | null = null;
-      try {
-        parsed = JSON.parse(resBody);
-      } catch {
-        // not JSON
-      }
+      try { parsed = JSON.parse(resBody); } catch { /* not JSON */ }
 
       if (parsed) {
         const included = (parsed.included || []) as Record<string, unknown>[];
-        const types = [
-          ...new Set(
-            included.map((e) => String(e.$type || "unknown"))
-          ),
-        ];
+        const types = [...new Set(included.map((e) => String(e.$type || "unknown")))];
         steps["step3c_graphql"] = {
           status: res.status,
           ok: res.ok,
-          topKeys: Object.keys(parsed),
           includedCount: included.length,
           entityTypes: types,
-          firstThreeEntities: included.slice(0, 3).map((e) => ({
+          sampleEntities: included.slice(0, 3).map((e) => ({
             $type: e.$type,
             entityUrn: e.entityUrn,
             firstName: e.firstName,
@@ -228,7 +183,6 @@ export async function POST(request: NextRequest) {
       } else {
         steps["step3c_graphql"] = {
           status: res.status,
-          ok: res.ok,
           rawBody: resBody.substring(0, 500),
         };
       }
