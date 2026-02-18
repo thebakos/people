@@ -14,22 +14,33 @@ const USER_AGENT =
 export async function searchDuckDuckGo(
   query: string
 ): Promise<SearchResult[]> {
-  const response = await fetch("https://html.duckduckgo.com/html/", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": USER_AGENT,
-    },
-    body: `q=${encodeURIComponent(query)}`,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
 
-  if (!response.ok) {
-    console.error(`DuckDuckGo search error: ${response.status}`);
+  try {
+    const response = await fetch("https://html.duckduckgo.com/html/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+      },
+      body: `q=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      console.error(`DuckDuckGo search error: ${response.status}`);
+      return [];
+    }
+
+    const html = await response.text();
+    return parseSearchResults(html);
+  } catch (e) {
+    console.error(`DuckDuckGo fetch failed: ${e instanceof Error ? e.message : e}`);
     return [];
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const html = await response.text();
-  return parseSearchResults(html);
 }
 
 /**
