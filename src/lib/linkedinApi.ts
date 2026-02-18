@@ -1,4 +1,5 @@
 import { delay } from "./duckduckgo";
+import { searchEmployees } from "./linkedinSearch";
 
 const LINKEDIN_API_BASE = "https://www.linkedin.com/voyager/api";
 
@@ -9,55 +10,12 @@ interface LinkedInEmployee {
 }
 
 /**
- * Fetch a real JSESSIONID from LinkedIn.
- * Uses a lightweight HEAD request with a timeout to avoid hanging.
- * Falls back to null if it can't obtain one (will use ajax:timestamp instead).
- */
-async function fetchJSessionId(liAtCookie: string): Promise<string | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-
-  try {
-    // Use a HEAD request to the homepage — much lighter than fetching /feed/
-    const res = await fetch("https://www.linkedin.com/", {
-      method: "HEAD",
-      headers: {
-        Cookie: `li_at=${liAtCookie}`,
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-      redirect: "manual",
-      signal: controller.signal,
-    });
-
-    // Extract JSESSIONID from Set-Cookie headers
-    const setCookieHeaders = res.headers.getSetCookie?.() || [];
-    for (const cookie of setCookieHeaders) {
-      const match = cookie.match(/JSESSIONID="?([^";]+)"?/);
-      if (match) return match[1];
-    }
-
-    // Try raw header as fallback (some runtimes merge set-cookie headers)
-    const rawSetCookie = res.headers.get("set-cookie") || "";
-    const match = rawSetCookie.match(/JSESSIONID="?([^";]+)"?/);
-    if (match) return match[1];
-  } catch {
-    // Timeout or network error — fall back to generated token
-  } finally {
-    clearTimeout(timeout);
-  }
-  return null;
-}
-
-/**
  * Build the required headers for LinkedIn Voyager API requests.
- * Uses a real JSESSIONID if provided, otherwise generates one.
+ * Uses a generated ajax:timestamp CSRF token — never fetches a real
+ * JSESSIONID from LinkedIn (that causes session invalidation).
  */
-function buildHeaders(
-  liAtCookie: string,
-  jsessionId?: string | null
-): Record<string, string> {
-  const csrfToken = jsessionId || `ajax:${Date.now()}`;
+function buildHeaders(liAtCookie: string): Record<string, string> {
+  const csrfToken = `ajax:${Date.now()}`;
   return {
     Cookie: `li_at=${liAtCookie}; JSESSIONID="${csrfToken}"`,
     "Csrf-Token": csrfToken,
@@ -67,11 +25,6 @@ function buildHeaders(
     Accept: "application/vnd.linkedin.normalized+json+2.1",
     Referer: "https://www.linkedin.com/search/results/people/",
     Origin: "https://www.linkedin.com",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Dest": "empty",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
   };
 }
 
@@ -84,100 +37,52 @@ function extractCompanySlug(url: string): string {
 }
 
 /**
- * Validate that the LinkedIn cookie is still valid.
- * Returns the JSESSIONID to use for subsequent requests.
- */
-export async function validateAuth(
-  liAtCookie: string
-): Promise<{ jsessionId: string; valid: boolean }> {
-  // Step 1: Get a real JSESSIONID from LinkedIn
-  const jsessionId = await fetchJSessionId(liAtCookie);
-  const token = jsessionId || `ajax:${Date.now()}`;
-  const headers = buildHeaders(liAtCookie, token);
-
-  // Step 2: Test auth with /me endpoint (with timeout)
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-  try {
-    const res = await fetch(`${LINKEDIN_API_BASE}/me`, {
-      headers,
-      signal: controller.signal,
-    });
-    return { jsessionId: token, valid: res.ok };
-  } catch {
-    return { jsessionId: token, valid: false };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-/**
  * Get company info (name + numeric ID) from LinkedIn using the Voyager API.
- * The response uses { data, included } format where entities are in `included`.
  */
 export async function getCompanyInfo(
   companyUrl: string,
-  liAtCookie: string,
-  jsessionId?: string
+  liAtCookie: string
 ): Promise<{ companyName: string; companyId: string }> {
   const slug = extractCompanySlug(companyUrl);
   if (!slug) {
     throw new Error("Could not extract company slug from URL");
   }
 
-  const headers = buildHeaders(liAtCookie, jsessionId);
+  const headers = buildHeaders(liAtCookie);
 
   const url = `${LINKEDIN_API_BASE}/organization/companies?decorationId=com.linkedin.voyager.deco.organization.web.WebFullCompanyMain-12&q=universalName&universalName=${encodeURIComponent(slug)}`;
 
-  const response = await fetch(url, { headers });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
 
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      throw new Error(
-        "LinkedIn authentication failed. Your session cookie may have expired."
-      );
-    }
-    throw new Error(`LinkedIn company lookup error: ${response.status}`);
-  }
+  try {
+    const response = await fetch(url, { headers, signal: controller.signal });
 
-  const json = await response.json();
-
-  // Voyager API returns { data: ..., included: [...entities...] }
-  const included = (json.included || []) as Record<string, unknown>[];
-  const dataObj = json.data as Record<string, unknown> | undefined;
-
-  let companyName = slug
-    .replace(/-/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-  let companyId = "";
-
-  // Strategy 1: Look for the entity whose universalName matches the slug exactly
-  for (const entity of included) {
-    if (entity.universalName === slug) {
-      if (entity.name) companyName = String(entity.name);
-      const entityUrn = String(entity.entityUrn || "");
-      const idMatch = entityUrn.match(
-        /(?:company|fs_normalized_company|fsd_company):(\d+)/
-      );
-      if (idMatch) {
-        companyId = idMatch[1];
-        break;
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(
+          "LinkedIn authentication failed. Your session cookie may have expired."
+        );
       }
+      throw new Error(`LinkedIn company lookup error: ${response.status}`);
     }
-  }
 
-  // Strategy 2: Look for Company-typed entities
-  if (!companyId) {
+    const json = await response.json();
+    const included = (json.included || []) as Record<string, unknown>[];
+    const dataObj = json.data as Record<string, unknown> | undefined;
+
+    let companyName = slug
+      .replace(/-/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+    let companyId = "";
+
+    // Strategy 1: Look for the entity whose universalName matches the slug
     for (const entity of included) {
-      const type = String(entity.$type || "");
-      if (
-        type.includes("organization.Company") ||
-        type.includes("organization.Organization")
-      ) {
+      if (entity.universalName === slug) {
         if (entity.name) companyName = String(entity.name);
         const entityUrn = String(entity.entityUrn || "");
         const idMatch = entityUrn.match(
-          /(?:company|fs_normalized_company):(\d+)/
+          /(?:company|fs_normalized_company|fsd_company):(\d+)/
         );
         if (idMatch) {
           companyId = idMatch[1];
@@ -185,94 +90,115 @@ export async function getCompanyInfo(
         }
       }
     }
-  }
 
-  // Strategy 3: Look for the main data entity's company reference
-  if (!companyId && dataObj) {
-    // The data object often has a direct reference like "*elements" or entityUrn
-    const dataStr = JSON.stringify(dataObj);
-    const idMatch = dataStr.match(
-      /urn:li:(?:company|fs_normalized_company|fsd_company):(\d+)/
-    );
-    if (idMatch) {
-      companyId = idMatch[1];
-    }
-  }
-
-  // Strategy 4: Extract company ID from FollowingInfo or any URN containing company:<id>
-  // But SKIP entities that look like sub-companies (check name doesn't differ too much)
-  if (!companyId) {
-    for (const entity of included) {
-      const entityUrn = String(entity.entityUrn || "");
-      const idMatch = entityUrn.match(/urn:li:company:(\d+)/);
-      if (idMatch) {
-        companyId = idMatch[1];
-        if (entity.name) companyName = String(entity.name);
-        break;
+    // Strategy 2: Look for Company-typed entities
+    if (!companyId) {
+      for (const entity of included) {
+        const type = String(entity.$type || "");
+        if (
+          type.includes("organization.Company") ||
+          type.includes("organization.Organization")
+        ) {
+          if (entity.name) companyName = String(entity.name);
+          const entityUrn = String(entity.entityUrn || "");
+          const idMatch = entityUrn.match(
+            /(?:company|fs_normalized_company):(\d+)/
+          );
+          if (idMatch) {
+            companyId = idMatch[1];
+            break;
+          }
+        }
       }
     }
-  }
 
-  // Strategy 5: Search all string values for any company ID reference
-  if (!companyId) {
-    for (const entity of included) {
-      for (const value of Object.values(entity)) {
-        const str = String(value || "");
-        const idMatch = str.match(
-          /(?:company|fs_normalized_company|fs_miniCompany):(\d+)/
-        );
+    // Strategy 3: data object reference
+    if (!companyId && dataObj) {
+      const dataStr = JSON.stringify(dataObj);
+      const idMatch = dataStr.match(
+        /urn:li:(?:company|fs_normalized_company|fsd_company):(\d+)/
+      );
+      if (idMatch) companyId = idMatch[1];
+    }
+
+    // Strategy 4: Any URN containing company:<id>
+    if (!companyId) {
+      for (const entity of included) {
+        const entityUrn = String(entity.entityUrn || "");
+        const idMatch = entityUrn.match(/urn:li:company:(\d+)/);
         if (idMatch) {
           companyId = idMatch[1];
+          if (entity.name) companyName = String(entity.name);
           break;
         }
       }
-      if (companyId) break;
     }
-  }
 
-  // Try to get company name from included entities if we still have the default
-  const defaultName = slug
-    .replace(/-/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-  if (companyId && companyName === defaultName) {
-    for (const entity of included) {
-      if (
-        entity.name &&
-        String(entity.entityUrn || "").includes(companyId)
-      ) {
-        companyName = String(entity.name);
-        break;
+    // Strategy 5: Search all string values
+    if (!companyId) {
+      for (const entity of included) {
+        for (const value of Object.values(entity)) {
+          const str = String(value || "");
+          const idMatch = str.match(
+            /(?:company|fs_normalized_company|fs_miniCompany):(\d+)/
+          );
+          if (idMatch) {
+            companyId = idMatch[1];
+            break;
+          }
+        }
+        if (companyId) break;
       }
     }
-  }
 
-  if (!companyId) {
-    throw new Error(
-      `Could not find company ID for "${slug}". Got ${included.length} included entities but no company URN found.`
-    );
-  }
+    // Try to get company name from included entities if still default
+    const defaultName = slug
+      .replace(/-/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+    if (companyId && companyName === defaultName) {
+      for (const entity of included) {
+        if (
+          entity.name &&
+          String(entity.entityUrn || "").includes(companyId)
+        ) {
+          companyName = String(entity.name);
+          break;
+        }
+      }
+    }
 
-  return { companyName, companyId };
+    if (!companyId) {
+      throw new Error(
+        `Could not find company ID for "${slug}". Got ${included.length} included entities but no company URN found.`
+      );
+    }
+
+    return { companyName, companyId };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /**
  * Search for employees at a company using LinkedIn's Voyager search API.
- * Paginates through multiple pages to collect up to `limit` results.
+ * Tries multiple endpoints, falls back gracefully.
  */
 export async function searchCompanyEmployees(
   companyId: string,
   liAtCookie: string,
-  limit: number = 50,
-  jsessionId?: string
+  limit: number = 10
 ): Promise<LinkedInEmployee[]> {
-  const headers = buildHeaders(liAtCookie, jsessionId);
+  const headers = buildHeaders(liAtCookie);
 
-  // Try the search/dash/clusters endpoint first (newer format)
+  // Try the search/dash/clusters endpoint (newer format)
   const employees = await trySearchDashClusters(companyId, headers, limit);
   if (employees.length > 0) return employees;
 
   // Fallback: try the search/blended endpoint
-  return trySearchBlended(companyId, headers, limit);
+  const blendedEmployees = await trySearchBlended(companyId, headers, limit);
+  if (blendedEmployees.length > 0) return blendedEmployees;
+
+  return [];
 }
 
 async function trySearchDashClusters(
@@ -280,7 +206,6 @@ async function trySearchDashClusters(
   headers: Record<string, string>,
   limit: number
 ): Promise<LinkedInEmployee[]> {
-  // Try multiple decorationId versions as LinkedIn updates these
   const decorationIds = [
     "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186",
     "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-185",
@@ -306,18 +231,20 @@ async function trySearchDashClusters(
           `&start=${start}` +
           `&count=${pageSize}`;
 
-        const response = await fetch(url, { headers });
-        console.log(`[clusters] decorationId=${decorationId.slice(-3)}, start=${start}, status=${response.status}`);
-        if (!response.ok) {
-          console.log(`[clusters] Non-OK response, trying next decorationId`);
-          break;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
+
+        let response: Response;
+        try {
+          response = await fetch(url, { headers, signal: controller.signal });
+        } finally {
+          clearTimeout(timeout);
         }
 
-        const json = await response.json();
-        const included = (json.included || []) as Record<string, unknown>[];
-        const types = [...new Set(included.map((e: Record<string, unknown>) => String(e.$type || "")))];
-        console.log(`[clusters] Included entities: ${included.length}, types: ${types.join(", ")}`);
+        console.log(`[clusters] decorationId=${decorationId.slice(-3)}, start=${start}, status=${response.status}`);
+        if (!response.ok) break;
 
+        const json = await response.json();
         const pageEmployees = parseSearchResults(json, limit);
         console.log(`[clusters] Parsed employees from page: ${pageEmployees.length}`);
 
@@ -332,22 +259,16 @@ async function trySearchDashClusters(
           addedNew = true;
         }
 
-        // If no new unique employees found, stop paginating
         if (!addedNew) break;
-
         start += pageSize;
 
-        // Rate limit between pages
-        if (allEmployees.length < limit) {
-          await delay(400);
-        }
+        if (allEmployees.length < limit) await delay(400);
       } catch (e) {
-        console.error(`[clusters] Error:`, e);
+        console.log(`[clusters] Failed: ${e instanceof Error ? e.message : e}`);
         break;
       }
     }
 
-    // If this decorationId worked (got results), don't try others
     if (allEmployees.length > 0) break;
   }
 
@@ -374,7 +295,16 @@ async function trySearchBlended(
         `&q=all` +
         `&start=${start}`;
 
-      const response = await fetch(url, { headers });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      let response: Response;
+      try {
+        response = await fetch(url, { headers, signal: controller.signal });
+      } finally {
+        clearTimeout(timeout);
+      }
+
       if (!response.ok) break;
 
       const json = await response.json();
@@ -392,12 +322,9 @@ async function trySearchBlended(
       }
 
       if (!addedNew) break;
-
       start += pageSize;
 
-      if (allEmployees.length < limit) {
-        await delay(400);
-      }
+      if (allEmployees.length < limit) await delay(400);
     } catch {
       break;
     }
@@ -408,10 +335,6 @@ async function trySearchBlended(
 
 /**
  * Extract text from a LinkedIn title/subtitle field.
- * LinkedIn API returns these as either:
- *   - An object: { text: "Name", textDirection: "...", ... }
- *   - A JSON string: '{"text":"Name","textDirection":"..."}'
- *   - A plain string: "Name"
  */
 function extractText(value: unknown): string {
   if (!value) return "";
@@ -435,17 +358,14 @@ function extractText(value: unknown): string {
 
 /**
  * Extract a LinkedIn profile URL from various entity fields.
- * Checks navigationUrl, navigationContext.url, and entityUrn.
  */
 function extractProfileUrl(entity: Record<string, unknown>): string {
-  // Try navigationUrl first (direct string)
   const candidates: string[] = [];
 
   if (typeof entity.navigationUrl === "string") {
     candidates.push(entity.navigationUrl);
   }
 
-  // Try navigationContext (object or JSON string with url property)
   const navCtx = entity.navigationContext;
   if (navCtx && typeof navCtx === "object") {
     const url = (navCtx as Record<string, unknown>).url;
@@ -469,9 +389,6 @@ function extractProfileUrl(entity: Record<string, unknown>): string {
 
 /**
  * Parse LinkedIn search API response to extract employee info.
- * Handles multiple response formats:
- *   - MiniProfile entities (older/blended search): firstName, lastName, publicIdentifier
- *   - EntityResultViewModel entities (dash/clusters search): title.text, navigationUrl
  */
 function parseSearchResults(
   json: Record<string, unknown>,
@@ -493,16 +410,12 @@ function parseSearchResults(
     return true;
   };
 
-  // Strategy 1: MiniProfile entities (richest data — has firstName, lastName, publicIdentifier)
+  // Strategy 1: MiniProfile entities
   for (const entity of included) {
     if (employees.length >= limit) break;
 
     const type = String(entity.$type || "");
-    const isProfile =
-      type.includes("MiniProfile") ||
-      type.includes("identity.shared.MiniProfile");
-
-    if (!isProfile) continue;
+    if (!type.includes("MiniProfile") && !type.includes("identity.shared.MiniProfile")) continue;
 
     const firstName = String(entity.firstName || "");
     const lastName = String(entity.lastName || "");
@@ -514,18 +427,13 @@ function parseSearchResults(
     addEmployee(name, headline, `https://www.linkedin.com/in/${publicId}`);
   }
 
-  // Strategy 2: EntityResultViewModel entities (dash/clusters search result cards)
+  // Strategy 2: EntityResultViewModel entities
   if (employees.length === 0) {
     for (const entity of included) {
       if (employees.length >= limit) break;
 
       const type = String(entity.$type || "");
-      if (
-        !type.includes("EntityResultViewModel") &&
-        !type.includes("SearchHitV2")
-      ) {
-        continue;
-      }
+      if (!type.includes("EntityResultViewModel") && !type.includes("SearchHitV2")) continue;
 
       const name = extractText(entity.title);
       const headline = extractText(entity.primarySubtitle);
@@ -540,44 +448,43 @@ function parseSearchResults(
 
 /**
  * High-level function: find employees at a LinkedIn company URL.
+ * Uses the Voyager API for company info, then tries Voyager search.
+ * If Voyager search fails (common in some environments), falls back
+ * to DuckDuckGo-based LinkedIn profile search.
+ *
+ * IMPORTANT: Does NOT make HEAD requests or validate auth separately —
+ * that was causing LinkedIn to invalidate the user's session cookie.
  */
 export async function findCompanyEmployees(
   companyUrl: string,
   liAtCookie: string,
-  limit: number = 50
+  limit: number = 10
 ): Promise<{
   companyName: string;
   employees: LinkedInEmployee[];
 }> {
-  // First, validate auth and get a real JSESSIONID
-  console.log(`[linkedin] Validating auth...`);
-  const { jsessionId, valid } = await validateAuth(liAtCookie);
-  console.log(`[linkedin] Auth valid: ${valid}, JSESSIONID: ${jsessionId?.substring(0, 15)}...`);
-
-  if (!valid) {
-    throw new Error(
-      "LinkedIn authentication failed. Your session cookie may have expired. Please get a fresh li_at cookie from your browser."
-    );
-  }
-
+  // Get company info via Voyager API (this endpoint works reliably)
   console.log(`[linkedin] Looking up company: ${companyUrl}`);
   const { companyName, companyId } = await getCompanyInfo(
     companyUrl,
-    liAtCookie,
-    jsessionId
+    liAtCookie
   );
   console.log(`[linkedin] Company found: ${companyName} (ID: ${companyId})`);
 
   await delay(500);
 
-  console.log(`[linkedin] Searching for employees (limit: ${limit})...`);
-  const employees = await searchCompanyEmployees(
-    companyId,
-    liAtCookie,
-    limit,
-    jsessionId
-  );
-  console.log(`[linkedin] Search complete: ${employees.length} employees found`);
+  // Try Voyager search endpoints first
+  console.log(`[linkedin] Trying Voyager search for employees (limit: ${limit})...`);
+  let employees = await searchCompanyEmployees(companyId, liAtCookie, limit);
+
+  // If Voyager search returned nothing, fall back to DuckDuckGo
+  if (employees.length === 0) {
+    console.log(`[linkedin] Voyager search returned 0 results, falling back to DuckDuckGo...`);
+    employees = await searchEmployees(companyUrl, companyName, limit);
+    console.log(`[linkedin] DuckDuckGo fallback found: ${employees.length} employees`);
+  } else {
+    console.log(`[linkedin] Voyager search found: ${employees.length} employees`);
+  }
 
   return { companyName, employees };
 }
