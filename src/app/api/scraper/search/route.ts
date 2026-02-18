@@ -82,24 +82,31 @@ export async function POST(request: NextRequest) {
 
     if (liAtCookie) {
       // Use LinkedIn Voyager API with authentication
-      console.log("Using LinkedIn API with authentication...");
+      console.log(`[search] Using LinkedIn API for: ${url}`);
+      console.log(`[search] Cookie present: ${liAtCookie.length} chars`);
       const result = await findCompanyEmployees(url, liAtCookie);
       companyName = result.companyName;
       employees = result.employees;
+      console.log(`[search] Company: ${companyName}, Employees found: ${employees.length}`);
+      if (employees.length > 0) {
+        console.log(`[search] First employee: ${employees[0].name} — ${employees[0].headline}`);
+      }
     } else {
       // Fallback: use DuckDuckGo search (may return fewer results)
-      console.log("No LinkedIn cookie — falling back to DuckDuckGo search...");
+      console.log("[search] No LinkedIn cookie — falling back to DuckDuckGo search...");
       companyName = await getCompanyName(url);
       await delay(1000);
       employees = await searchEmployees(url, companyName);
+      console.log(`[search] DuckDuckGo fallback: ${companyName}, ${employees.length} employees`);
     }
 
     if (employees.length === 0) {
+      console.log(`[search] No employees found for ${companyName}`);
       return NextResponse.json({
         companyName,
         results: [],
         message: liAtCookie
-          ? "No employees found at this company."
+          ? "No employees found at this company. The company may be too small or LinkedIn may be restricting results."
           : "No results found. Try adding your LinkedIn session cookie for better results.",
       });
     }

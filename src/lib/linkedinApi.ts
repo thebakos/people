@@ -300,10 +300,19 @@ async function trySearchDashClusters(
           `&count=${pageSize}`;
 
         const response = await fetch(url, { headers });
-        if (!response.ok) break;
+        console.log(`[clusters] decorationId=${decorationId.slice(-3)}, start=${start}, status=${response.status}`);
+        if (!response.ok) {
+          console.log(`[clusters] Non-OK response, trying next decorationId`);
+          break;
+        }
 
         const json = await response.json();
+        const included = (json.included || []) as Record<string, unknown>[];
+        const types = [...new Set(included.map((e: Record<string, unknown>) => String(e.$type || "")))];
+        console.log(`[clusters] Included entities: ${included.length}, types: ${types.join(", ")}`);
+
         const pageEmployees = parseSearchResults(json, limit);
+        console.log(`[clusters] Parsed employees from page: ${pageEmployees.length}`);
 
         if (pageEmployees.length === 0) break;
 
@@ -325,7 +334,8 @@ async function trySearchDashClusters(
         if (allEmployees.length < limit) {
           await delay(400);
         }
-      } catch {
+      } catch (e) {
+        console.error(`[clusters] Error:`, e);
         break;
       }
     }
@@ -533,7 +543,9 @@ export async function findCompanyEmployees(
   employees: LinkedInEmployee[];
 }> {
   // First, validate auth and get a real JSESSIONID
+  console.log(`[linkedin] Validating auth...`);
   const { jsessionId, valid } = await validateAuth(liAtCookie);
+  console.log(`[linkedin] Auth valid: ${valid}, JSESSIONID: ${jsessionId?.substring(0, 15)}...`);
 
   if (!valid) {
     throw new Error(
@@ -541,20 +553,24 @@ export async function findCompanyEmployees(
     );
   }
 
+  console.log(`[linkedin] Looking up company: ${companyUrl}`);
   const { companyName, companyId } = await getCompanyInfo(
     companyUrl,
     liAtCookie,
     jsessionId
   );
+  console.log(`[linkedin] Company found: ${companyName} (ID: ${companyId})`);
 
   await delay(500);
 
+  console.log(`[linkedin] Searching for employees (limit: ${limit})...`);
   const employees = await searchCompanyEmployees(
     companyId,
     liAtCookie,
     limit,
     jsessionId
   );
+  console.log(`[linkedin] Search complete: ${employees.length} employees found`);
 
   return { companyName, employees };
 }
