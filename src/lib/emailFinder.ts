@@ -10,56 +10,20 @@ async function webSearch(query: string): Promise<SearchResult[]> {
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
 
 const BLOCKED_PATTERNS = [
-  "example.com",
-  "noreply",
-  "no-reply",
-  "support@",
-  "info@",
-  "contact@",
-  "help@",
-  "sales@",
-  "admin@",
-  "webmaster@",
-  "privacy@",
-  "legal@",
-  "abuse@",
-  "sentry.io",
-  "email.com",
-  "test.com",
-  "domain.com",
-  "company.com",
-  "yourcompany",
-  "placeholder",
-  "wixpress.com",
-  "schema.org",
-  "w3.org",
-  "googleapis.com",
-  "cloudflare",
-  "gravatar",
-  "wordpress",
-  "squarespace",
+  "example.com", "noreply", "no-reply", "support@", "info@",
+  "contact@", "help@", "sales@", "admin@", "webmaster@",
+  "privacy@", "legal@", "abuse@", "sentry.io", "email.com",
+  "test.com", "domain.com", "company.com", "yourcompany",
+  "placeholder", "wixpress.com", "schema.org", "w3.org",
+  "googleapis.com", "cloudflare", "gravatar", "wordpress", "squarespace",
 ];
 
-/** Common free/personal email providers — deprioritized but not blocked */
 const FREE_EMAIL_PROVIDERS = new Set([
-  "gmail.com",
-  "yahoo.com",
-  "hotmail.com",
-  "outlook.com",
-  "aol.com",
-  "icloud.com",
-  "protonmail.com",
-  "proton.me",
-  "mail.com",
-  "yandex.com",
-  "zoho.com",
-  "fastmail.com",
-  "tutanota.com",
-  "gmx.com",
-  "live.com",
+  "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
+  "icloud.com", "protonmail.com", "proton.me", "mail.com", "yandex.com",
+  "zoho.com", "fastmail.com", "tutanota.com", "gmx.com", "live.com",
 ]);
 
-/** Sites to skip when extracting company domain */
 const SKIP_DOMAINS = new Set([
   "linkedin.com", "facebook.com", "twitter.com", "x.com",
   "instagram.com", "youtube.com", "wikipedia.org", "crunchbase.com",
@@ -70,18 +34,40 @@ const SKIP_DOMAINS = new Set([
 ]);
 
 // ────────────────────────────────────────────────────────────────────────────
-// PUBLIC API — called from the search route
+// PUBLIC API
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Find a company's email domain. Called ONCE per company.
- * Uses 2-3 DuckDuckGo searches max.
+ * Find a company's email domain.
+ * Priority: LinkedIn website URL → domain generation + HTTP check → DDG/Bing
  */
 export async function findCompanyDomain(
-  company: string
+  company: string,
+  websiteUrl?: string
 ): Promise<string | null> {
+  // Strategy 1: Use the LinkedIn-provided website URL
+  if (websiteUrl) {
+    try {
+      const parsed = new URL(websiteUrl);
+      const domain = parsed.hostname.replace(/^www\./, "").toLowerCase();
+      if (domain && !SKIP_DOMAINS.has(domain) && !FREE_EMAIL_PROVIDERS.has(domain)) {
+        console.log(`[email] Domain from LinkedIn website: ${domain}`);
+        return domain;
+      }
+    } catch {
+      // Invalid URL
+    }
+  }
+
+  // Strategy 2: Generate domain from company name and verify with HTTP HEAD
+  const guessedDomain = await guessCompanyDomain(company);
+  if (guessedDomain) {
+    console.log(`[email] Domain guessed + verified: ${guessedDomain}`);
+    return guessedDomain;
+  }
+
+  // Strategy 3: Fall back to web search (if DDG/Bing work)
   try {
-    // Strategy 1: Search for the company website directly
     const results = await webSearch(`"${company}" official website`);
     for (const result of results) {
       const domain = extractCompanyDomain(result.url, company);
@@ -90,7 +76,6 @@ export async function findCompanyDomain(
 
     await delay(500);
 
-    // Strategy 2: Look for emails mentioning the company
     const results2 = await webSearch(`"${company}" "@" email contact`);
     for (const result of results2) {
       const text = `${result.title} ${result.snippet}`;
@@ -102,27 +87,69 @@ export async function findCompanyDomain(
         }
       }
     }
-
-    await delay(500);
-
-    // Strategy 3: Try company name as domain directly (common for VCs)
-    const slug = company.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const commonTlds = [".com", ".vc", ".co", ".io", ".xyz", ".capital"];
-    const results3 = await webSearch(
-      `site:${slug}.com OR site:${slug}.vc OR site:${slug}.co OR site:${slug}.io "${company}"`
-    );
-    for (const result of results3) {
-      for (const tld of commonTlds) {
-        if (result.url.includes(slug + tld)) {
-          return slug + tld;
-        }
-      }
-      // Also try extracting from the URL
-      const domain = extractCompanyDomain(result.url, company);
-      if (domain) return domain;
-    }
   } catch (e) {
-    console.error(`[email] Domain lookup failed for ${company}:`, e);
+    console.error(`[email] Web search domain lookup failed:`, e);
+  }
+
+  // Strategy 4: Just return the best guess without verification
+  const slug = company.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (slug.length >= 3) {
+    console.log(`[email] Using unverified domain guess: ${slug}.com`);
+    return `${slug}.com`;
+  }
+
+  return null;
+}
+
+/**
+ * Try common domain patterns and verify they exist with a HEAD request.
+ */
+async function guessCompanyDomain(company: string): Promise<string | null> {
+  const slug = company.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (slug.length < 3) return null;
+
+  // Also try without common suffixes
+  const slugNoSuffix = slug
+    .replace(/(ventures|capital|partners|group|fund|management|advisors|labs|holdings)$/, "")
+    .replace(/(vc|co|inc|llc|ltd)$/, "");
+
+  const candidates = new Set<string>();
+  // Full name
+  candidates.add(`${slug}.com`);
+  candidates.add(`${slug}.vc`);
+  candidates.add(`${slug}.co`);
+  candidates.add(`${slug}.io`);
+  // Without suffix
+  if (slugNoSuffix && slugNoSuffix !== slug && slugNoSuffix.length >= 2) {
+    candidates.add(`${slugNoSuffix}.com`);
+    candidates.add(`${slugNoSuffix}.vc`);
+    candidates.add(`${slugNoSuffix}.co`);
+    candidates.add(`${slugNoSuffix}.io`);
+  }
+
+  // Try each candidate with a quick HEAD request
+  for (const domain of candidates) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      try {
+        const res = await fetch(`https://${domain}`, {
+          method: "HEAD",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          },
+          signal: controller.signal,
+          redirect: "follow",
+        });
+        if (res.ok || res.status === 301 || res.status === 302 || res.status === 403) {
+          return domain;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {
+      // Domain doesn't resolve — skip
+    }
   }
 
   return null;
@@ -130,8 +157,8 @@ export async function findCompanyDomain(
 
 /**
  * Detect the email pattern used by a company.
- * Tests a few employees' names against the domain using DuckDuckGo.
- * Returns a pattern string like "first.last", "flast", "firstl", etc.
+ * Tests a few employees' names against the domain using DDG.
+ * Returns quickly if web search isn't working.
  */
 export async function detectEmailPattern(
   employees: { name: string }[],
@@ -141,47 +168,44 @@ export async function detectEmailPattern(
     { id: "first.last", gen: (f: string, l: string) => `${f}.${l}` },
     { id: "firstlast", gen: (f: string, l: string) => `${f}${l}` },
     { id: "flast", gen: (f: string, l: string) => `${f[0]}${l}` },
-    { id: "first", gen: (f: string, l: string) => `${f}` },
+    { id: "first", gen: (f: string) => `${f}` },
     { id: "f.last", gen: (f: string, l: string) => `${f[0]}.${l}` },
     { id: "last.first", gen: (f: string, l: string) => `${l}.${f}` },
     { id: "first_last", gen: (f: string, l: string) => `${f}_${l}` },
   ];
 
-  // Try to find a confirmed email for 1-2 employees to detect the pattern
-  for (const emp of employees.slice(0, 2)) {
-    const { first, last } = parseName(emp.name);
-    if (!first || !last) continue;
+  // Try to detect pattern with just 1 employee to save time
+  const emp = employees[0];
+  if (!emp) return null;
 
-    const f = first.toLowerCase();
-    const l = last.toLowerCase();
+  const { first, last } = parseName(emp.name);
+  if (!first || !last) return null;
 
-    try {
-      // Search for any email at this domain for this person
-      const query = `"${emp.name}" "@${domain}"`;
-      const results = await webSearch(query);
+  const f = first.toLowerCase();
+  const l = last.toLowerCase();
 
-      for (const result of results) {
-        const text = `${result.title} ${result.snippet}`;
-        const emails = (text.match(EMAIL_REGEX) || [])
-          .map((e) => e.toLowerCase())
-          .filter((e) => e.endsWith(`@${domain}`));
+  try {
+    const query = `"${emp.name}" "@${domain}"`;
+    const results = await webSearch(query);
 
-        for (const email of emails) {
-          const local = email.split("@")[0];
-          // Match against known patterns
-          for (const pat of PATTERNS) {
-            if (local === pat.gen(f, l)) {
-              console.log(`[email] Pattern detected: ${pat.id} (from ${email})`);
-              return pat.id;
-            }
+    for (const result of results) {
+      const text = `${result.title} ${result.snippet}`;
+      const emails = (text.match(EMAIL_REGEX) || [])
+        .map((e) => e.toLowerCase())
+        .filter((e) => e.endsWith(`@${domain}`));
+
+      for (const email of emails) {
+        const local = email.split("@")[0];
+        for (const pat of PATTERNS) {
+          if (local === pat.gen(f, l)) {
+            console.log(`[email] Pattern detected: ${pat.id} (from ${email})`);
+            return pat.id;
           }
         }
       }
-
-      await delay(500);
-    } catch {
-      // Search failed, continue
     }
+  } catch {
+    // Web search failed — use default pattern
   }
 
   return null;
@@ -189,9 +213,8 @@ export async function detectEmailPattern(
 
 /**
  * Find an email for a single person.
- * If domain and pattern are known, generates the email directly (no DDG search).
- * If domain is known but pattern isn't, uses "first.last" as default.
- * If no domain, falls back to a single DDG search.
+ * If domain is known, generates pattern-based email directly.
+ * Skips DDG verification since web search may not work.
  */
 export async function findEmailWithDomain(
   name: string,
@@ -201,43 +224,19 @@ export async function findEmailWithDomain(
 ): Promise<string> {
   const { first, last } = parseName(name);
 
-  // If we have a domain, generate the email from the pattern
+  // If we have a domain, generate the email from the pattern — done.
   if (domain && first && last) {
-    const f = first.toLowerCase();
-    const l = last.toLowerCase();
-
-    const email = applyPattern(f, l, domain, pattern || "first.last");
-
-    // Quick verification: one DDG search to see if this email appears online
-    try {
-      const results = await webSearch(`"${email}"`);
-      if (results.length > 0) {
-        for (const result of results) {
-          const text = `${result.title} ${result.snippet}`;
-          if (text.toLowerCase().includes(email)) {
-            return email; // Confirmed!
-          }
-        }
-      }
-    } catch {
-      // Search failed — still return the pattern-based guess
-    }
-
-    // Return the pattern-based email even if we couldn't confirm it
-    return email;
+    return applyPattern(first.toLowerCase(), last.toLowerCase(), domain, pattern || "first.last");
   }
 
   // No domain — try a direct search (1 DDG query)
   if (first && last) {
     try {
-      const results = await webSearch(
-        `"${name}" "${company}" email`
-      );
+      const results = await webSearch(`"${name}" "${company}" email`);
       for (const result of results) {
         const text = `${result.title} ${result.snippet}`;
         const emails = extractValidEmails(text);
         if (emails.length > 0) {
-          // Prefer company-domain emails over free providers
           const companyEmail = emails.find(
             (e) => !FREE_EMAIL_PROVIDERS.has(e.split("@")[1])
           );
@@ -253,7 +252,7 @@ export async function findEmailWithDomain(
 }
 
 /**
- * Legacy API — still used by existing code if needed.
+ * Legacy API — still used by existing code.
  */
 export async function findEmail(
   name: string,
@@ -267,72 +266,48 @@ export async function findEmail(
 // INTERNAL HELPERS
 // ────────────────────────────────────────────────────────────────────────────
 
-function applyPattern(
-  first: string,
-  last: string,
-  domain: string,
-  pattern: string
-): string {
+function applyPattern(first: string, last: string, domain: string, pattern: string): string {
   switch (pattern) {
-    case "first.last":
-      return `${first}.${last}@${domain}`;
-    case "firstlast":
-      return `${first}${last}@${domain}`;
-    case "flast":
-      return `${first[0]}${last}@${domain}`;
-    case "first":
-      return `${first}@${domain}`;
-    case "f.last":
-      return `${first[0]}.${last}@${domain}`;
-    case "last.first":
-      return `${last}.${first}@${domain}`;
-    case "first_last":
-      return `${first}_${last}@${domain}`;
-    case "firstl":
-      return `${first}${last[0]}@${domain}`;
-    default:
-      return `${first}.${last}@${domain}`;
+    case "first.last": return `${first}.${last}@${domain}`;
+    case "firstlast": return `${first}${last}@${domain}`;
+    case "flast": return `${first[0]}${last}@${domain}`;
+    case "first": return `${first}@${domain}`;
+    case "f.last": return `${first[0]}.${last}@${domain}`;
+    case "last.first": return `${last}.${first}@${domain}`;
+    case "first_last": return `${first}_${last}@${domain}`;
+    case "firstl": return `${first}${last[0]}@${domain}`;
+    default: return `${first}.${last}@${domain}`;
   }
 }
 
 function parseName(fullName: string): { first: string; last: string } {
   const cleaned = fullName
     .replace(/\s+(jr\.?|sr\.?|ii|iii|iv|phd|md|esq\.?)$/i, "")
-    .replace(/\(.*?\)/g, "") // Remove parenthetical nicknames
+    .replace(/\(.*?\)/g, "")
     .trim();
 
   const parts = cleaned.split(/\s+/);
   if (parts.length === 0) return { first: "", last: "" };
   if (parts.length === 1) return { first: parts[0], last: "" };
 
-  return {
-    first: parts[0],
-    last: parts[parts.length - 1],
-  };
+  return { first: parts[0], last: parts[parts.length - 1] };
 }
 
 function extractValidEmails(text: string): string[] {
   const matches = text.match(EMAIL_REGEX) || [];
-  return matches
-    .map((e) => e.toLowerCase())
-    .filter((e) => !isBlockedEmail(e));
+  return matches.map((e) => e.toLowerCase()).filter((e) => !isBlockedEmail(e));
 }
 
 function isBlockedEmail(email: string): boolean {
   for (const pattern of BLOCKED_PATTERNS) {
     if (email.includes(pattern)) return true;
   }
-  if (email.includes("...")) return false;
   const tld = email.split(".").pop() || "";
-  const badTlds = ["png", "jpg", "gif", "css", "js", "svg", "ico", "pdf"];
-  if (badTlds.includes(tld)) return true;
+  if (["png", "jpg", "gif", "css", "js", "svg", "ico", "pdf"].includes(tld)) return true;
   return false;
 }
 
-function extractCompanyDomain(
-  url: string,
-  company: string
-): string | null {
+function extractCompanyDomain(url: string, company: string): string | null {
   try {
     const parsed = new URL(url);
     const hostname = parsed.hostname.toLowerCase();
@@ -342,22 +317,13 @@ function extractCompanyDomain(
     }
 
     const domain = hostname.replace(/^www\./, "");
-    if (domain.split(".").length < 2) return null;
-    if (domain.length > 50) return null;
+    if (domain.split(".").length < 2 || domain.length > 50) return null;
 
-    // Check if domain relates to company name
-    const companyWords = company
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, "")
-      .split(/\s+/)
-      .filter((w) => w.length > 2);
-
+    const companyWords = company.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter((w) => w.length > 2);
     const domainBase = domain.split(".")[0];
-    const matches = companyWords.some(
-      (word) => domainBase.includes(word) || word.includes(domainBase)
-    );
-
-    if (matches) return domain;
+    if (companyWords.some((word) => domainBase.includes(word) || word.includes(domainBase))) {
+      return domain;
+    }
     return null;
   } catch {
     return null;

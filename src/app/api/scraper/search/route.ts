@@ -33,6 +33,7 @@ export async function POST(request: NextRequest) {
   try {
     let companyName: string;
     let employees: { name: string; linkedinUrl: string; headline: string }[];
+    let websiteUrl = "";
 
     if (liAtCookie) {
       // Try LinkedIn Voyager API first, fall back to DuckDuckGo on any failure
@@ -41,7 +42,8 @@ export async function POST(request: NextRequest) {
         const result = await findCompanyEmployees(url, liAtCookie, 10);
         companyName = result.companyName;
         employees = result.employees;
-        console.log(`[search] Company: ${companyName}, Employees found: ${employees.length}`);
+        websiteUrl = result.websiteUrl || "";
+        console.log(`[search] Company: ${companyName}, Employees found: ${employees.length}, Website: ${websiteUrl || "none"}`);
       } catch (apiError) {
         const msg = apiError instanceof Error ? apiError.message : String(apiError);
         // Re-throw auth errors so the user knows their cookie is bad
@@ -76,8 +78,9 @@ export async function POST(request: NextRequest) {
     }
 
     // Step 1: Find the company's email domain ONCE
-    console.log(`[search] Finding email domain for ${companyName}...`);
-    const domain = await findCompanyDomain(companyName);
+    // Pass the LinkedIn-provided website URL to avoid dependence on web search
+    console.log(`[search] Finding email domain for ${companyName} (LinkedIn website: ${websiteUrl || "none"})...`);
+    const domain = await findCompanyDomain(companyName, websiteUrl || undefined);
     console.log(`[search] Company domain: ${domain || "not found"}`);
 
     // Step 2: If we have a domain, try to detect the email pattern from the

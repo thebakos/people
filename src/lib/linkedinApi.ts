@@ -30,7 +30,7 @@ function buildApiHeaders(liAtCookie: string): Record<string, string> {
 }
 
 /**
- * Build headers for fetching LinkedIn HTML pages (like a browser).
+ * Build headers for fetching LinkedIn HTML pages (browser-like).
  */
 function buildPageHeaders(liAtCookie: string): Record<string, string> {
   const csrfToken = `ajax:${Date.now()}`;
@@ -54,14 +54,17 @@ function extractCompanySlug(url: string): string {
   return match ? match[1] : "";
 }
 
+// ---------------------------------------------------------------------------
+// COMPANY INFO (Voyager API — works reliably)
+// ---------------------------------------------------------------------------
+
 /**
- * Get company info (name + numeric ID) from LinkedIn using the Voyager API.
- * This endpoint still works reliably.
+ * Get company info (name, numeric ID, website) from LinkedIn Voyager API.
  */
 export async function getCompanyInfo(
   companyUrl: string,
   liAtCookie: string
-): Promise<{ companyName: string; companyId: string }> {
+): Promise<{ companyName: string; companyId: string; websiteUrl: string }> {
   const slug = extractCompanySlug(companyUrl);
   if (!slug) throw new Error("Could not extract company slug from URL");
 
@@ -87,26 +90,34 @@ export async function getCompanyInfo(
 
     let companyName = slug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
     let companyId = "";
+    let websiteUrl = "";
 
-    // Strategy 1: Entity whose universalName matches the slug
+    // Scan all included entities for company info
     for (const entity of included) {
-      if (entity.universalName === slug) {
+      // Extract website URL from any entity that has one
+      if (!websiteUrl) {
+        const site = entity.companyPageUrl || entity.websiteUrl || entity.website || entity.url;
+        if (typeof site === "string" && site.startsWith("http") && !site.includes("linkedin.com")) {
+          websiteUrl = site;
+        }
+      }
+
+      // Strategy 1: Entity whose universalName matches the slug
+      if (!companyId && entity.universalName === slug) {
         if (entity.name) companyName = String(entity.name);
         const entityUrn = String(entity.entityUrn || "");
         const idMatch = entityUrn.match(/(?:company|fs_normalized_company|fsd_company):(\d+)/);
-        if (idMatch) { companyId = idMatch[1]; break; }
+        if (idMatch) companyId = idMatch[1];
       }
-    }
 
-    // Strategy 2: Company-typed entities
-    if (!companyId) {
-      for (const entity of included) {
+      // Strategy 2: Company-typed entities
+      if (!companyId) {
         const type = String(entity.$type || "");
         if (type.includes("organization.Company") || type.includes("organization.Organization")) {
           if (entity.name) companyName = String(entity.name);
           const entityUrn = String(entity.entityUrn || "");
           const idMatch = entityUrn.match(/(?:company|fs_normalized_company):(\d+)/);
-          if (idMatch) { companyId = idMatch[1]; break; }
+          if (idMatch) companyId = idMatch[1];
         }
       }
     }
@@ -155,25 +166,171 @@ export async function getCompanyInfo(
     }
 
     if (!companyId) {
-      throw new Error(`Could not find company ID for "${slug}". Got ${included.length} included entities but no company URN found.`);
+      throw new Error(`Could not find company ID for "${slug}".`);
     }
 
-    return { companyName, companyId };
+    console.log(`[company] Website URL from LinkedIn: ${websiteUrl || "(none)"}`);
+    return { companyName, companyId, websiteUrl };
   } finally {
     clearTimeout(timeout);
   }
 }
 
 // ---------------------------------------------------------------------------
-// PRIMARY APPROACH: Scrape LinkedIn search results HTML page
+// HTML PAGE SCRAPING — Primary approach for finding employees
 // ---------------------------------------------------------------------------
 
+/** Extract text from a LinkedIn title/subtitle field */
+function extractText(value: unknown): string {
+  if (!value) return "";
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj.text === "string") return obj.text;
+  }
+  if (typeof value === "string") return value;
+  return "";
+}
+
+/** Extract a clean LinkedIn profile URL from a navigation URL */
+function extractProfileUrl(rawUrl: string): string {
+  const match = rawUrl.match(/linkedin\.com\/in\/([^/?#]+)/);
+  if (match) return `https://www.linkedin.com/in/${match[1]}`;
+  return "";
+}
+
 /**
- * Fetch a LinkedIn page and extract MiniProfile data from embedded JSON.
- * LinkedIn SSR pages contain <code> blocks with JSON payloads that include
- * the rendered data — this is the same data React hydrates on the client.
+ * Parse all JSON payloads from <code> blocks in a LinkedIn HTML page.
+ * Returns an array of all `included` entity arrays found.
  */
-async function fetchAndExtractProfiles(
+function parseCodeBlocks(html: string): Record<string, unknown>[][] {
+  const results: Record<string, unknown>[][] = [];
+  const codeRegex = /<code[^>]*>([\s\S]*?)<\/code>/g;
+  let match;
+  while ((match = codeRegex.exec(html)) !== null) {
+    try {
+      const decoded = match[1]
+        .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+        .replace(/&amp;/g, "&").replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
+      const data = JSON.parse(decoded);
+      if (data.included && Array.isArray(data.included)) {
+        results.push(data.included as Record<string, unknown>[]);
+      }
+    } catch {
+      // Not valid JSON — skip
+    }
+  }
+  return results;
+}
+
+/**
+ * Extract SEARCH RESULT employees from LinkedIn embedded JSON.
+ * Only extracts from EntityResultViewModel (actual search results),
+ * NOT from random MiniProfiles (which include sidebar, suggestions, etc.).
+ */
+function extractSearchResultEmployees(
+  allIncluded: Record<string, unknown>[][],
+  limit: number,
+): LinkedInEmployee[] {
+  const employees: LinkedInEmployee[] = [];
+  const seen = new Set<string>();
+
+  // Strategy 1: EntityResultViewModel — these ARE the search results
+  for (const included of allIncluded) {
+    for (const entity of included) {
+      if (employees.length >= limit) break;
+
+      const type = String(entity.$type || "");
+      if (!type.includes("EntityResultViewModel") && !type.includes("SearchHitV2")) continue;
+
+      const name = extractText(entity.title);
+      if (!name || name === "LinkedIn Member") continue;
+
+      // Get headline
+      const headline = extractText(entity.primarySubtitle) || extractText(entity.headline);
+
+      // Get profile URL from various fields
+      let profileUrl = "";
+      if (typeof entity.navigationUrl === "string") {
+        profileUrl = extractProfileUrl(entity.navigationUrl);
+      }
+      if (!profileUrl) {
+        const navCtx = entity.navigationContext;
+        if (navCtx && typeof navCtx === "object") {
+          const url = (navCtx as Record<string, unknown>).url;
+          if (typeof url === "string") profileUrl = extractProfileUrl(url);
+        }
+      }
+
+      if (!profileUrl) continue;
+      if (seen.has(profileUrl)) continue;
+      seen.add(profileUrl);
+
+      employees.push({ name, headline, linkedinUrl: profileUrl });
+    }
+  }
+
+  // Strategy 2: If no EntityResultViewModels found, try MiniProfiles
+  // but only those that look like they're from search results
+  // (have an occupation/headline, are not the same as the logged-in user)
+  if (employees.length === 0) {
+    // First, collect all MiniProfile URNs that are referenced by result entities
+    const resultProfileUrns = new Set<string>();
+    for (const included of allIncluded) {
+      for (const entity of included) {
+        const type = String(entity.$type || "");
+        if (type.includes("SearchHit") || type.includes("EntityResult") || type.includes("ResultCard")) {
+          // These entities reference profiles via URN strings in their fields
+          const jsonStr = JSON.stringify(entity);
+          const urnMatches = jsonStr.match(/urn:li:(?:fs_miniProfile|fsd_profile):[^"]+/g);
+          if (urnMatches) {
+            for (const urn of urnMatches) resultProfileUrns.add(urn);
+          }
+        }
+      }
+    }
+
+    for (const included of allIncluded) {
+      for (const entity of included) {
+        if (employees.length >= limit) break;
+
+        const type = String(entity.$type || "");
+        if (!type.includes("MiniProfile") && !type.includes("identity.shared.MiniProfile")) continue;
+        if (!entity.publicIdentifier || !entity.firstName) continue;
+
+        // If we have result URNs, only include matching MiniProfiles
+        if (resultProfileUrns.size > 0) {
+          const entityUrn = String(entity.entityUrn || "");
+          if (!resultProfileUrns.has(entityUrn)) continue;
+        }
+
+        const firstName = String(entity.firstName || "");
+        const lastName = String(entity.lastName || "");
+        const name = `${firstName} ${lastName}`.trim();
+        const publicId = String(entity.publicIdentifier || "");
+
+        if (!name || name === "LinkedIn Member" || !publicId) continue;
+
+        const profileUrl = `https://www.linkedin.com/in/${publicId}`;
+        if (seen.has(profileUrl)) continue;
+        seen.add(profileUrl);
+
+        employees.push({
+          name,
+          headline: String(entity.occupation || entity.headline || ""),
+          linkedinUrl: profileUrl,
+        });
+      }
+    }
+  }
+
+  return employees;
+}
+
+/**
+ * Fetch a LinkedIn page and extract employee data from search results.
+ */
+async function fetchAndExtractSearchResults(
   pageUrl: string,
   headers: Record<string, string>,
   limit: number,
@@ -196,120 +353,22 @@ async function fetchAndExtractProfiles(
   const html = await response.text();
   console.log(`[html] Got ${html.length} chars`);
 
-  // Parse all <code> blocks — LinkedIn embeds JSON data in these
-  const codeRegex = /<code[^>]*>([\s\S]*?)<\/code>/g;
-  let match;
-  while ((match = codeRegex.exec(html)) !== null && employees.length < limit) {
-    try {
-      const decoded = match[1]
-        .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-        .replace(/&amp;/g, "&").replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'");
-      const data = JSON.parse(decoded);
-      extractMiniProfiles(data, employees, seen, limit);
-    } catch {
-      // Not valid JSON — skip
-    }
+  const allIncluded = parseCodeBlocks(html);
+  console.log(`[html] Found ${allIncluded.length} JSON payloads with included arrays`);
+
+  const newEmployees = extractSearchResultEmployees(allIncluded, limit);
+  console.log(`[html] Extracted ${newEmployees.length} search result employees`);
+
+  for (const emp of newEmployees) {
+    if (employees.length >= limit) break;
+    if (seen.has(emp.linkedinUrl)) continue;
+    seen.add(emp.linkedinUrl);
+    employees.push(emp);
   }
-
-  // Also check <script type="application/json"> blocks
-  const scriptRegex = /<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/g;
-  while ((match = scriptRegex.exec(html)) !== null && employees.length < limit) {
-    try {
-      const data = JSON.parse(match[1]);
-      extractMiniProfiles(data, employees, seen, limit);
-    } catch {
-      // Not valid JSON
-    }
-  }
-}
-
-/**
- * Extract MiniProfile entities from a JSON structure (recursive).
- * LinkedIn includes profile data in `included` arrays within its JSON payloads.
- */
-function extractMiniProfiles(
-  data: unknown,
-  employees: LinkedInEmployee[],
-  seen: Set<string>,
-  limit: number,
-  depth: number = 0
-): void {
-  if (employees.length >= limit || depth > 5 || !data || typeof data !== "object") return;
-
-  // If it has an `included` array, scan it for MiniProfile entities
-  if (!Array.isArray(data) && typeof data === "object") {
-    const obj = data as Record<string, unknown>;
-
-    // Check `included` array (standard Voyager response shape)
-    const included = obj.included;
-    if (Array.isArray(included)) {
-      for (const entity of included) {
-        if (employees.length >= limit) break;
-        if (!entity || typeof entity !== "object") continue;
-        const record = entity as Record<string, unknown>;
-        tryAddProfile(record, employees, seen);
-      }
-    }
-
-    // Check if this object itself is a profile
-    tryAddProfile(obj, employees, seen);
-
-    // Recurse into object values
-    for (const value of Object.values(obj)) {
-      if (employees.length >= limit) break;
-      if (typeof value === "object" && value !== null) {
-        extractMiniProfiles(value, employees, seen, limit, depth + 1);
-      }
-    }
-  }
-
-  // Recurse into arrays
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      if (employees.length >= limit) break;
-      extractMiniProfiles(item, employees, seen, limit, depth + 1);
-    }
-  }
-}
-
-/** Try to add a record as a profile if it has the right fields */
-function tryAddProfile(
-  record: Record<string, unknown>,
-  employees: LinkedInEmployee[],
-  seen: Set<string>
-): boolean {
-  const type = String(record.$type || "");
-
-  // MiniProfile entity (most common)
-  if (type.includes("MiniProfile") || type.includes("identity.shared.MiniProfile") ||
-      (record.publicIdentifier && record.firstName)) {
-    const firstName = String(record.firstName || "");
-    const lastName = String(record.lastName || "");
-    const name = `${firstName} ${lastName}`.trim();
-    const publicId = String(record.publicIdentifier || "");
-
-    if (!name || name === "LinkedIn Member" || !publicId) return false;
-
-    const profileUrl = `https://www.linkedin.com/in/${publicId}`;
-    if (seen.has(profileUrl)) return false;
-    seen.add(profileUrl);
-
-    employees.push({
-      name,
-      headline: String(record.occupation || record.headline || ""),
-      linkedinUrl: profileUrl,
-    });
-    return true;
-  }
-
-  return false;
 }
 
 /**
  * Search for company employees by scraping the LinkedIn search results page.
- * This fetches the actual HTML that a browser would see and parses the
- * embedded JSON data from <code> blocks.
  */
 async function scrapeSearchResults(
   companyId: string,
@@ -320,25 +379,24 @@ async function scrapeSearchResults(
   const employees: LinkedInEmployee[] = [];
   const seen = new Set<string>();
 
-  // Fetch the people search results page filtered by company
+  // Page 1
   const searchUrl = `https://www.linkedin.com/search/results/people/?currentCompany=%5B%22${companyId}%22%5D&origin=COMPANY_PAGE_CANNED_SEARCH`;
   console.log(`[html] Fetching search results page for company ${companyId}...`);
-  await fetchAndExtractProfiles(searchUrl, headers, limit, employees, seen);
-  console.log(`[html] Search page: ${employees.length} employees found`);
+  await fetchAndExtractSearchResults(searchUrl, headers, limit, employees, seen);
+  console.log(`[html] After page 1: ${employees.length} employees`);
 
-  // If we need more, try page 2
+  // Page 2 if needed
   if (employees.length > 0 && employees.length < limit) {
     await delay(800);
-    const page2Url = `${searchUrl}&page=2`;
-    await fetchAndExtractProfiles(page2Url, headers, limit, employees, seen);
-    console.log(`[html] After page 2: ${employees.length} employees total`);
+    await fetchAndExtractSearchResults(`${searchUrl}&page=2`, headers, limit, employees, seen);
+    console.log(`[html] After page 2: ${employees.length} employees`);
   }
 
   return employees;
 }
 
 /**
- * Fallback: scrape the company's /people/ page for embedded employee data.
+ * Fallback: scrape the company's /people/ page.
  */
 async function scrapeCompanyPeoplePage(
   companySlug: string,
@@ -349,30 +407,22 @@ async function scrapeCompanyPeoplePage(
   const employees: LinkedInEmployee[] = [];
   const seen = new Set<string>();
 
-  // The company people page
   const pageUrl = `https://www.linkedin.com/company/${companySlug}/people/`;
   console.log(`[html] Fetching company people page...`);
-  await fetchAndExtractProfiles(pageUrl, headers, limit, employees, seen);
-  console.log(`[html] Company people page: ${employees.length} employees found`);
-
-  // Also try the main company page
-  if (employees.length < limit) {
-    await delay(500);
-    const mainUrl = `https://www.linkedin.com/company/${companySlug}/`;
-    await fetchAndExtractProfiles(mainUrl, headers, limit, employees, seen);
-    console.log(`[html] After main page: ${employees.length} employees total`);
-  }
+  await fetchAndExtractSearchResults(pageUrl, headers, limit, employees, seen);
+  console.log(`[html] Company people page: ${employees.length} employees`);
 
   return employees;
 }
 
+// ---------------------------------------------------------------------------
+// PUBLIC API
+// ---------------------------------------------------------------------------
+
 /**
- * High-level function: find employees at a LinkedIn company URL.
+ * Find employees at a LinkedIn company URL.
  *
- * Strategy (in order):
- * 1. Scrape LinkedIn search results page HTML (most reliable)
- * 2. Scrape company /people/ page HTML
- * 3. Fall back to web search (DDG → Bing)
+ * Strategy: search page HTML → company /people/ page → web search
  */
 export async function findCompanyEmployees(
   companyUrl: string,
@@ -381,34 +431,34 @@ export async function findCompanyEmployees(
 ): Promise<{
   companyName: string;
   employees: LinkedInEmployee[];
+  websiteUrl: string;
 }> {
-  // Get company info via Voyager API (this endpoint works reliably)
   console.log(`[linkedin] Looking up company: ${companyUrl}`);
-  const { companyName, companyId } = await getCompanyInfo(companyUrl, liAtCookie);
-  console.log(`[linkedin] Company found: ${companyName} (ID: ${companyId})`);
+  const { companyName, companyId, websiteUrl } = await getCompanyInfo(companyUrl, liAtCookie);
+  console.log(`[linkedin] Company: ${companyName} (ID: ${companyId}, website: ${websiteUrl || "none"})`);
 
   const slug = extractCompanySlug(companyUrl);
   await delay(500);
 
   // 1. Scrape LinkedIn search results page (primary)
-  console.log(`[linkedin] Scraping search results page for employees...`);
+  console.log(`[linkedin] Scraping search results page...`);
   let employees = await scrapeSearchResults(companyId, liAtCookie, limit);
 
   // 2. Scrape company people page (fallback)
   if (employees.length === 0 && slug) {
-    console.log(`[linkedin] Search page returned 0, trying company people page...`);
+    console.log(`[linkedin] Search page empty, trying company people page...`);
     await delay(500);
     employees = await scrapeCompanyPeoplePage(slug, liAtCookie, limit);
   }
 
   // 3. Web search fallback (DDG → Bing)
   if (employees.length === 0) {
-    console.log(`[linkedin] All LinkedIn methods failed, falling back to web search...`);
+    console.log(`[linkedin] All LinkedIn methods failed, trying web search...`);
     employees = await searchEmployees(companyUrl, companyName, limit);
-    console.log(`[linkedin] Web search fallback found: ${employees.length} employees`);
+    console.log(`[linkedin] Web search: ${employees.length} employees`);
   } else {
     console.log(`[linkedin] Found: ${employees.length} employees`);
   }
 
-  return { companyName, employees };
+  return { companyName, employees, websiteUrl };
 }
