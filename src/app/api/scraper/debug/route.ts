@@ -2,121 +2,45 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCompanyInfo } from "@/lib/linkedinApi";
 import { searchDuckDuckGo, searchBing } from "@/lib/duckduckgo";
 
-/** Serialize an error, including its .cause chain */
+const LINKEDIN_API_BASE = "https://www.linkedin.com/voyager/api";
+
 function errorDetail(e: unknown): unknown {
   if (e instanceof Error) {
-    return {
-      message: e.message,
-      name: e.name,
-      cause: e.cause ? errorDetail(e.cause) : undefined,
-      code: (e as NodeJS.ErrnoException).code,
-    };
+    return { message: e.message, name: e.name, cause: e.cause ? errorDetail(e.cause) : undefined };
   }
   return String(e);
 }
 
-/**
- * Build headers for fetching LinkedIn HTML pages (like a browser).
- */
-function buildPageHeaders(liAtCookie: string): Record<string, string> {
-  const csrfToken = `ajax:${Date.now()}`;
-  return {
-    Cookie: `li_at=${liAtCookie}; JSESSIONID="${csrfToken}"`,
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-  };
-}
-
-/** Fetch a LinkedIn HTML page, return metadata about the embedded data */
-async function testPageScrape(
+async function apiFetch(
   url: string,
-  headers: Record<string, string>
-): Promise<{
-  status: number;
-  htmlLength: number;
-  codeBlocks: number;
-  miniProfileCount: number;
-  profileNames: string[];
-  htmlPreview: string;
-  error?: string;
-}> {
+  headers: Record<string, string>,
+  timeoutMs: number = 10000
+): Promise<{ status: number; preview: string; entityTypes?: string[]; entityCount?: number }> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
-
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    let response: Response;
+    const res = await fetch(url, { headers, signal: controller.signal });
+    const text = await res.text();
+    let entityTypes: string[] | undefined;
+    let entityCount: number | undefined;
     try {
-      response = await fetch(url, { headers, signal: controller.signal, redirect: "follow" });
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    const html = await response.text();
-    const codeBlocks = (html.match(/<code[^>]*>/g) || []).length;
-
-    // Count MiniProfiles found in <code> blocks
-    const profiles: string[] = [];
-    const codeRegex = /<code[^>]*>([\s\S]*?)<\/code>/g;
-    let match;
-    while ((match = codeRegex.exec(html)) !== null && profiles.length < 20) {
-      try {
-        const decoded = match[1]
-          .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-          .replace(/&amp;/g, "&").replace(/&quot;/g, '"')
-          .replace(/&#39;/g, "'");
-        const data = JSON.parse(decoded);
-        const included = data.included;
-        if (Array.isArray(included)) {
-          for (const entity of included) {
-            if (!entity || typeof entity !== "object") continue;
-            const type = String(entity.$type || "");
-            if (type.includes("MiniProfile") || (entity.publicIdentifier && entity.firstName)) {
-              const firstName = String(entity.firstName || "");
-              const lastName = String(entity.lastName || "");
-              const name = `${firstName} ${lastName}`.trim();
-              if (name && name !== "LinkedIn Member") {
-                profiles.push(name);
-              }
-            }
-          }
-        }
-      } catch {
-        // Not valid JSON
+      const json = JSON.parse(text);
+      const included = json.included as Record<string, unknown>[] | undefined;
+      if (included && included.length > 0) {
+        entityCount = included.length;
+        entityTypes = [...new Set(included.map((e: Record<string, unknown>) => String(e.$type || "?")))];
       }
-    }
-
-    return {
-      status: response.status,
-      htmlLength: html.length,
-      codeBlocks,
-      miniProfileCount: profiles.length,
-      profileNames: profiles.slice(0, 10),
-      htmlPreview: html.slice(0, 400),
-    };
+    } catch { /* not JSON */ }
+    return { status: res.status, preview: text.slice(0, 300), entityTypes, entityCount };
   } catch (e) {
-    return {
-      status: -1,
-      htmlLength: 0,
-      codeBlocks: 0,
-      miniProfileCount: 0,
-      profileNames: [],
-      htmlPreview: "",
-      error: e instanceof Error ? e.message : String(e),
-    };
+    return { status: -1, preview: e instanceof Error ? e.message : String(e) };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
 /**
- * Debug endpoint — tests the HTML scraping approach + web search engines.
- * POST /api/scraper/debug
+ * Debug endpoint — tests all approaches.
  */
 export async function POST(request: NextRequest) {
   const body = await request.json();
@@ -130,7 +54,22 @@ export async function POST(request: NextRequest) {
     companyUrl?.match(/linkedin\.com\/company\/([^/?#]+)/)?.[1] || "sequoia-capital";
   const steps: Record<string, unknown> = {};
 
-  // Step 1: Company lookup (Voyager API)
+  // Build headers
+  const csrfToken = `ajax:${Date.now()}`;
+  const headers: Record<string, string> = {
+    Cookie: `li_at=${linkedinCookie}; JSESSIONID="${csrfToken}"`,
+    "Csrf-Token": csrfToken,
+    "X-Restli-Protocol-Version": "2.0.0",
+    "X-Li-Lang": "en_US",
+    "X-Li-Track": '{"clientVersion":"1.13.8286","mpVersion":"1.13.8286","osName":"web","timezoneOffset":-5,"deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1}',
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    Accept: "application/vnd.linkedin.normalized+json+2.1",
+    "Accept-Language": "en-US,en;q=0.9",
+    Referer: "https://www.linkedin.com/search/results/people/",
+    Origin: "https://www.linkedin.com",
+  };
+
+  // Step 1: Company lookup
   let companyId = "";
   let companyName = "";
   try {
@@ -140,43 +79,56 @@ export async function POST(request: NextRequest) {
     );
     companyId = info.companyId;
     companyName = info.companyName;
-    steps["step1_company"] = { companyName, companyId, authValid: true };
+    steps["step1_company"] = { companyName, companyId, websiteUrl: info.websiteUrl, authValid: true };
   } catch (e) {
     steps["step1_error"] = errorDetail(e);
     return NextResponse.json({ slug, steps });
   }
 
-  const headers = buildPageHeaders(linkedinCookie);
+  // Step 2: Identify logged-in user via /me
+  steps["step2_me"] = await apiFetch(`${LINKEDIN_API_BASE}/me`, headers);
 
-  // Step 2: Test search results page HTML scraping (PRIMARY approach)
-  const searchUrl = `https://www.linkedin.com/search/results/people/?currentCompany=%5B%22${companyId}%22%5D&origin=COMPANY_PAGE_CANNED_SEARCH`;
-  steps["step2_search_page_scrape"] = await testPageScrape(searchUrl, headers);
+  // Step 3: Voyager search (list-style query)
+  const queryList = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:List((key:currentCompany,value:List(${companyId})),(key:resultType,value:List(PEOPLE))),includeFiltersInResponse:false)`;
+  steps["step3_voyager_search"] = await apiFetch(
+    `${LINKEDIN_API_BASE}/search/dash/clusters?decorationId=${encodeURIComponent("com.linkedin.voyager.dash.deco.search.SearchClusterCollection-193")}&origin=COMPANY_PAGE_CANNED_SEARCH&q=all&query=${encodeURIComponent(queryList)}&start=0&count=10`,
+    headers
+  );
 
-  // Step 3: Test company people page HTML scraping (FALLBACK)
-  const peopleUrl = `https://www.linkedin.com/company/${slug}/people/`;
-  steps["step3_company_people_page"] = await testPageScrape(peopleUrl, headers);
+  // Step 4: GraphQL search
+  const graphqlVars = `(start:0,origin:COMPANY_PAGE_CANNED_SEARCH,query:${queryList},count:10)`;
+  steps["step4_graphql_search"] = await apiFetch(
+    `${LINKEDIN_API_BASE}/graphql?includeWebMetadata=true&variables=${encodeURIComponent(graphqlVars)}&queryId=voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0`,
+    headers
+  );
 
-  // Step 4: Test DuckDuckGo
+  // Step 5: Organization employees endpoints (different from search!)
+  const orgEndpoints = {
+    "org_employees_slug": `${LINKEDIN_API_BASE}/graphql?variables=(start:0,count:10,companyUniversalName:${slug})&queryId=voyagerOrganizationDashEmployees.b0928897b71bd00a5a7291755dcd64f0`,
+    "org_employees_urn": `${LINKEDIN_API_BASE}/graphql?variables=(start:0,count:10,companyUrn:urn%3Ali%3Afsd_company%3A${companyId})&queryId=voyagerOrganizationDashEmployees.b0928897b71bd00a5a7291755dcd64f0`,
+    "org_dash_search": `${LINKEDIN_API_BASE}/organization/dash/companies?decorationId=com.linkedin.voyager.dash.deco.organization.MemberCompany-28&q=search&companyId=${companyId}&start=0&count=10`,
+  };
+  const orgResults: Record<string, unknown> = {};
+  for (const [name, url] of Object.entries(orgEndpoints)) {
+    orgResults[name] = await apiFetch(url, headers, 8000);
+  }
+  steps["step5_org_employees"] = orgResults;
+
+  // Step 6: DuckDuckGo
   const ddgQuery = `site:linkedin.com/in "${companyName}" partner OR director`;
   try {
     const ddgResults = await searchDuckDuckGo(ddgQuery);
-    steps["step4_duckduckgo"] = {
-      resultCount: ddgResults.length,
-      results: ddgResults.slice(0, 3).map(r => ({ url: r.url, title: r.title })),
-    };
+    steps["step6_duckduckgo"] = { resultCount: ddgResults.length, results: ddgResults.slice(0, 3) };
   } catch (e) {
-    steps["step4_duckduckgo_error"] = errorDetail(e);
+    steps["step6_duckduckgo_error"] = errorDetail(e);
   }
 
-  // Step 5: Test Bing
+  // Step 7: Bing
   try {
     const bingResults = await searchBing(ddgQuery);
-    steps["step5_bing"] = {
-      resultCount: bingResults.length,
-      results: bingResults.slice(0, 3).map(r => ({ url: r.url, title: r.title })),
-    };
+    steps["step7_bing"] = { resultCount: bingResults.length, results: bingResults.slice(0, 3) };
   } catch (e) {
-    steps["step5_bing_error"] = errorDetail(e);
+    steps["step7_bing_error"] = errorDetail(e);
   }
 
   return NextResponse.json({ slug, companyId, companyName, steps });
