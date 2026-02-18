@@ -1,4 +1,4 @@
-import { searchDuckDuckGo, delay } from "./duckduckgo";
+import { searchDuckDuckGo, searchBing, delay, SearchResult } from "./duckduckgo";
 
 export interface FoundEmployee {
   name: string;
@@ -7,12 +7,23 @@ export interface FoundEmployee {
 }
 
 /**
+ * Search using DuckDuckGo first, then Bing as fallback.
+ */
+async function webSearch(query: string): Promise<SearchResult[]> {
+  const results = await searchDuckDuckGo(query);
+  if (results.length > 0) return results;
+
+  console.log(`[search] DDG returned 0 results, trying Bing...`);
+  return searchBing(query);
+}
+
+/**
  * Extract the company name from a LinkedIn company URL by searching DuckDuckGo.
- * Falls back to parsing the URL slug.
+ * Falls back to Bing, then to parsing the URL slug.
  */
 export async function getCompanyName(companyUrl: string): Promise<string> {
   try {
-    const results = await searchDuckDuckGo(companyUrl);
+    const results = await webSearch(companyUrl);
     // The first result is usually the company's LinkedIn page
     // Title format: "Company Name | LinkedIn" or "Company Name: Overview | LinkedIn"
     for (const r of results) {
@@ -47,7 +58,7 @@ export async function searchEmployees(
   const roleTerms = "partner OR director OR principal OR associate OR vice president";
   const query = `site:linkedin.com/in "${companyName}" ${roleTerms}`;
 
-  const results = await searchDuckDuckGo(query);
+  const results = await webSearch(query);
 
   const employees: FoundEmployee[] = [];
   const seenUrls = new Set<string>();
@@ -82,7 +93,7 @@ export async function searchEmployees(
   if (employees.length < limit) {
     await delay(1000);
     const query2 = `site:linkedin.com/in "${companyName}" investment OR venture OR fund`;
-    const results2 = await searchDuckDuckGo(query2);
+    const results2 = await webSearch(query2);
 
     for (const result of results2) {
       if (employees.length >= limit) break;

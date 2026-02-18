@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCompanyInfo } from "@/lib/linkedinApi";
+import { searchDuckDuckGo, searchBing } from "@/lib/duckduckgo";
 
 const LINKEDIN_API_BASE = "https://www.linkedin.com/voyager/api";
 
@@ -76,52 +77,54 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ slug, steps });
   }
 
-  // Build headers
+  // Build headers (same as linkedinApi.ts buildHeaders)
   const csrfToken = `ajax:${Date.now()}`;
   const headers: Record<string, string> = {
     Cookie: `li_at=${linkedinCookie}; JSESSIONID="${csrfToken}"`,
     "Csrf-Token": csrfToken,
     "X-Restli-Protocol-Version": "2.0.0",
+    "X-Li-Lang": "en_US",
+    "X-Li-Track": '{"clientVersion":"1.13.8286","mpVersion":"1.13.8286","osName":"web","timezoneOffset":-5,"deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1}',
     "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     Accept: "application/vnd.linkedin.normalized+json+2.1",
+    "Accept-Language": "en-US,en;q=0.9",
     Referer: "https://www.linkedin.com/search/results/people/",
     Origin: "https://www.linkedin.com",
   };
 
-  // Step 2: Try multiple search URL formats to find one that works
+  // Step 2: Try multiple search URL formats
+  const query = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
+  const querySimple = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)))`;
+
   const searchTests: Record<string, string> = {};
 
-  // Format A: search/dash/clusters with decorationId -186
-  const queryA = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
-  searchTests["A_clusters_186"] =
-    `${LINKEDIN_API_BASE}/search/dash/clusters?decorationId=${encodeURIComponent("com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186")}&origin=COMPANY_PAGE_CANNED_SEARCH&q=all&query=${encodeURIComponent(queryA)}&start=0&count=10`;
+  // Newer decoration IDs (193 down to 186)
+  for (const ver of [193, 192, 191, 190, 189, 188, 187, 186]) {
+    searchTests[`clusters_${ver}`] =
+      `${LINKEDIN_API_BASE}/search/dash/clusters?decorationId=${encodeURIComponent(`com.linkedin.voyager.dash.deco.search.SearchClusterCollection-${ver}`)}&origin=COMPANY_PAGE_CANNED_SEARCH&q=all&query=${encodeURIComponent(query)}&start=0&count=10`;
+  }
 
-  // Format B: search/dash/clusters with decorationId -165
-  searchTests["B_clusters_165"] =
-    `${LINKEDIN_API_BASE}/search/dash/clusters?decorationId=${encodeURIComponent("com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165")}&origin=COMPANY_PAGE_CANNED_SEARCH&q=all&query=${encodeURIComponent(queryA)}&start=0&count=10`;
+  // Without includeFiltersInResponse
+  searchTests["clusters_193_simple"] =
+    `${LINKEDIN_API_BASE}/search/dash/clusters?decorationId=${encodeURIComponent("com.linkedin.voyager.dash.deco.search.SearchClusterCollection-193")}&origin=COMPANY_PAGE_CANNED_SEARCH&q=all&query=${encodeURIComponent(querySimple)}&start=0&count=10`;
 
-  // Format C: search/dash/clusters with keywords param
-  const queryC = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),keywords:,resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
-  searchTests["C_clusters_keywords"] =
-    `${LINKEDIN_API_BASE}/search/dash/clusters?decorationId=${encodeURIComponent("com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186")}&origin=COMPANY_PAGE_CANNED_SEARCH&q=all&query=${encodeURIComponent(queryC)}&start=0&count=10`;
+  // Without decorationId
+  searchTests["clusters_no_deco"] =
+    `${LINKEDIN_API_BASE}/search/dash/clusters?origin=COMPANY_PAGE_CANNED_SEARCH&q=all&query=${encodeURIComponent(query)}&start=0&count=10`;
 
-  // Format D: search/blended (older endpoint)
-  searchTests["D_blended"] =
+  // GraphQL endpoints
+  const graphqlVars = `(start:0,origin:COMPANY_PAGE_CANNED_SEARCH,query:(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false),count:10)`;
+
+  searchTests["graphql_v1"] =
+    `${LINKEDIN_API_BASE}/graphql?includeWebMetadata=true&variables=${encodeURIComponent(graphqlVars)}&queryId=voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0`;
+
+  searchTests["graphql_v2"] =
+    `${LINKEDIN_API_BASE}/graphql?includeWebMetadata=true&variables=${encodeURIComponent(graphqlVars)}&queryId=voyagerSearchDashClusters.8f5a6f5f1a0dc14a9ce3e58be2f6d2fd`;
+
+  // Blended (legacy)
+  searchTests["blended"] =
     `${LINKEDIN_API_BASE}/search/blended?count=10&filters=${encodeURIComponent(`List(currentCompany->${companyId},resultType->PEOPLE)`)}&origin=COMPANY_PAGE_CANNED_SEARCH&q=all&start=0`;
-
-  // Format E: graphql search
-  const graphqlVars = `(start:0,origin:COMPANY_PAGE_CANNED_SEARCH,query:(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false))`;
-  searchTests["E_graphql"] =
-    `${LINKEDIN_API_BASE}/graphql?variables=${encodeURIComponent(graphqlVars)}&queryId=voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0`;
-
-  // Format F: search/dash/clusters without decorationId
-  searchTests["F_clusters_no_decoration"] =
-    `${LINKEDIN_API_BASE}/search/dash/clusters?origin=COMPANY_PAGE_CANNED_SEARCH&q=all&query=${encodeURIComponent(queryA)}&start=0&count=10`;
-
-  // Format G: typeahead endpoint
-  searchTests["G_typeahead"] =
-    `${LINKEDIN_API_BASE}/typeahead/hitsV2?keywords=&origin=COMPANY_PAGE_CANNED_SEARCH&q=federated&currentCompany=${companyId}`;
 
   const searchResults: Record<string, unknown> = {};
   for (const [name, url] of Object.entries(searchTests)) {
@@ -129,36 +132,28 @@ export async function POST(request: NextRequest) {
   }
   steps["step2_search_formats"] = searchResults;
 
-  // Step 3: Test DuckDuckGo with raw HTML check
+  // Step 3: Test DuckDuckGo
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    try {
-      const ddgQuery = `site:linkedin.com/in "${companyName}"`;
-      const res = await fetch("https://html.duckduckgo.com/html/", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        },
-        body: `q=${encodeURIComponent(ddgQuery)}`,
-        signal: controller.signal,
-      });
-      const html = await res.text();
-      const hasResults = html.includes('class="result__a"');
-      const resultCount = (html.match(/class="result__a"/g) || []).length;
-      steps["step3_duckduckgo"] = {
-        status: res.status,
-        htmlLength: html.length,
-        hasResultClass: hasResults,
-        resultCount,
-        htmlPreview: html.slice(0, 500),
-      };
-    } finally {
-      clearTimeout(timeout);
-    }
+    const ddgQuery = `site:linkedin.com/in "${companyName}" partner OR director`;
+    const ddgResults = await searchDuckDuckGo(ddgQuery);
+    steps["step3_duckduckgo"] = {
+      resultCount: ddgResults.length,
+      results: ddgResults.slice(0, 3).map(r => ({ url: r.url, title: r.title })),
+    };
   } catch (e) {
     steps["step3_duckduckgo_error"] = errorDetail(e);
+  }
+
+  // Step 4: Test Bing
+  try {
+    const bingQuery = `site:linkedin.com/in "${companyName}" partner OR director`;
+    const bingResults = await searchBing(bingQuery);
+    steps["step4_bing"] = {
+      resultCount: bingResults.length,
+      results: bingResults.slice(0, 3).map(r => ({ url: r.url, title: r.title })),
+    };
+  } catch (e) {
+    steps["step4_bing_error"] = errorDetail(e);
   }
 
   return NextResponse.json({ slug, companyId, companyName, steps });

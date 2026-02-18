@@ -20,9 +20,12 @@ function buildHeaders(liAtCookie: string): Record<string, string> {
     Cookie: `li_at=${liAtCookie}; JSESSIONID="${csrfToken}"`,
     "Csrf-Token": csrfToken,
     "X-Restli-Protocol-Version": "2.0.0",
+    "X-Li-Lang": "en_US",
+    "X-Li-Track": '{"clientVersion":"1.13.8286","mpVersion":"1.13.8286","osName":"web","timezoneOffset":-5,"deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1}',
     "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     Accept: "application/vnd.linkedin.normalized+json+2.1",
+    "Accept-Language": "en-US,en;q=0.9",
     Referer: "https://www.linkedin.com/search/results/people/",
     Origin: "https://www.linkedin.com",
   };
@@ -194,9 +197,17 @@ export async function searchCompanyEmployees(
   const employees = await trySearchDashClusters(companyId, headers, limit);
   if (employees.length > 0) return employees;
 
-  // Fallback: try the search/blended endpoint
+  console.log(`[linkedin] Clusters failed, trying GraphQL search...`);
+  const graphqlEmployees = await tryGraphQLSearch(companyId, headers, limit);
+  if (graphqlEmployees.length > 0) return graphqlEmployees;
+
+  console.log(`[linkedin] GraphQL failed, trying blended search...`);
   const blendedEmployees = await trySearchBlended(companyId, headers, limit);
   if (blendedEmployees.length > 0) return blendedEmployees;
+
+  console.log(`[linkedin] Blended failed, trying people search...`);
+  const peopleEmployees = await tryPeopleSearch(companyId, headers, limit);
+  if (peopleEmployees.length > 0) return peopleEmployees;
 
   return [];
 }
@@ -206,73 +217,201 @@ async function trySearchDashClusters(
   headers: Record<string, string>,
   limit: number
 ): Promise<LinkedInEmployee[]> {
+  // Try a wide range of decoration IDs — LinkedIn increments these over time
   const decorationIds = [
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-193",
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-192",
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-191",
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-190",
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-189",
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-188",
+    "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-187",
     "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186",
     "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-185",
     "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165",
+  ];
+
+  // Try multiple query formats in case the API changed
+  const queryFormats = [
+    // Format 1: Standard with flagshipSearchIntent
+    `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
+    // Format 2: Without includeFiltersInResponse
+    `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)))`,
+    // Format 3: With keywords param
+    `(flagshipSearchIntent:SEARCH_SRP,keywords:,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
   ];
 
   const pageSize = Math.min(49, limit);
   const allEmployees: LinkedInEmployee[] = [];
   const seen = new Set<string>();
 
-  for (const decorationId of decorationIds) {
-    let start = 0;
+  for (const queryTemplate of queryFormats) {
+    if (allEmployees.length > 0) break;
 
-    while (allEmployees.length < limit) {
-      try {
-        const query = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
-        const url =
-          `${LINKEDIN_API_BASE}/search/dash/clusters` +
-          `?decorationId=${encodeURIComponent(decorationId)}` +
-          `&origin=COMPANY_PAGE_CANNED_SEARCH` +
-          `&q=all` +
-          `&query=${encodeURIComponent(query)}` +
-          `&start=${start}` +
-          `&count=${pageSize}`;
+    for (const decorationId of decorationIds) {
+      if (allEmployees.length > 0) break;
+      let start = 0;
 
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-
-        let response: Response;
+      while (allEmployees.length < limit) {
         try {
-          response = await fetch(url, { headers, signal: controller.signal });
-        } finally {
-          clearTimeout(timeout);
+          const url =
+            `${LINKEDIN_API_BASE}/search/dash/clusters` +
+            `?decorationId=${encodeURIComponent(decorationId)}` +
+            `&origin=COMPANY_PAGE_CANNED_SEARCH` +
+            `&q=all` +
+            `&query=${encodeURIComponent(queryTemplate)}` +
+            `&start=${start}` +
+            `&count=${pageSize}`;
+
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 10000);
+
+          let response: Response;
+          try {
+            response = await fetch(url, { headers, signal: controller.signal });
+          } finally {
+            clearTimeout(timeout);
+          }
+
+          const decoShort = decorationId.slice(-3);
+          console.log(`[clusters] deco=${decoShort}, start=${start}, status=${response.status}`);
+
+          if (response.status === 400) break; // This decoration ID doesn't work
+          if (!response.ok) break;
+
+          const json = await response.json();
+          const pageEmployees = parseSearchResults(json, limit);
+          console.log(`[clusters] Parsed employees from page: ${pageEmployees.length}`);
+
+          if (pageEmployees.length === 0) break;
+
+          let addedNew = false;
+          for (const emp of pageEmployees) {
+            if (allEmployees.length >= limit) break;
+            if (seen.has(emp.linkedinUrl)) continue;
+            seen.add(emp.linkedinUrl);
+            allEmployees.push(emp);
+            addedNew = true;
+          }
+
+          if (!addedNew) break;
+          start += pageSize;
+
+          if (allEmployees.length < limit) await delay(400);
+        } catch (e) {
+          console.log(`[clusters] Failed: ${e instanceof Error ? e.message : e}`);
+          break;
         }
-
-        console.log(`[clusters] decorationId=${decorationId.slice(-3)}, start=${start}, status=${response.status}`);
-        if (!response.ok) break;
-
-        const json = await response.json();
-        const pageEmployees = parseSearchResults(json, limit);
-        console.log(`[clusters] Parsed employees from page: ${pageEmployees.length}`);
-
-        if (pageEmployees.length === 0) break;
-
-        let addedNew = false;
-        for (const emp of pageEmployees) {
-          if (allEmployees.length >= limit) break;
-          if (seen.has(emp.linkedinUrl)) continue;
-          seen.add(emp.linkedinUrl);
-          allEmployees.push(emp);
-          addedNew = true;
-        }
-
-        if (!addedNew) break;
-        start += pageSize;
-
-        if (allEmployees.length < limit) await delay(400);
-      } catch (e) {
-        console.log(`[clusters] Failed: ${e instanceof Error ? e.message : e}`);
-        break;
       }
     }
-
-    if (allEmployees.length > 0) break;
   }
 
   return allEmployees;
+}
+
+/**
+ * Try LinkedIn's GraphQL search endpoint with multiple queryId hashes.
+ */
+async function tryGraphQLSearch(
+  companyId: string,
+  headers: Record<string, string>,
+  limit: number
+): Promise<LinkedInEmployee[]> {
+  // LinkedIn GraphQL queryIds change with deployments — try several known ones
+  const queryIds = [
+    "voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0",
+    "voyagerSearchDashClusters.8f5a6f5f1a0dc14a9ce3e58be2f6d2fd",
+    "voyagerSearchDashClusters.66adc6056cf4138949ca5dcb31bb1749",
+  ];
+
+  const variables = `(start:0,origin:COMPANY_PAGE_CANNED_SEARCH,query:(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false),count:${Math.min(49, limit)})`;
+
+  for (const queryId of queryIds) {
+    try {
+      const url =
+        `${LINKEDIN_API_BASE}/graphql` +
+        `?includeWebMetadata=true` +
+        `&variables=${encodeURIComponent(variables)}` +
+        `&queryId=${queryId}`;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+
+      let response: Response;
+      try {
+        response = await fetch(url, { headers, signal: controller.signal });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      console.log(`[graphql] queryId=${queryId.slice(-8)}, status=${response.status}`);
+      if (!response.ok) continue;
+
+      const json = await response.json();
+      const employees = parseSearchResults(json, limit);
+      console.log(`[graphql] Parsed: ${employees.length} employees`);
+      if (employees.length > 0) return employees;
+    } catch (e) {
+      console.log(`[graphql] Failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Try LinkedIn's people search with a different query structure.
+ * Uses the search/dash/clusters endpoint with different parameters.
+ */
+async function tryPeopleSearch(
+  companyId: string,
+  headers: Record<string, string>,
+  limit: number
+): Promise<LinkedInEmployee[]> {
+  const pageSize = Math.min(49, limit);
+
+  // Try with a filter-based query instead of queryParameters
+  const filterQueries = [
+    // Filter using currentCompany with people origin
+    `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId})),includeFiltersInResponse:false)`,
+    // Simpler query without resultType filter
+    `(queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)))`,
+  ];
+
+  for (const query of filterQueries) {
+    try {
+      // Try without decorationId (let server pick default)
+      const url =
+        `${LINKEDIN_API_BASE}/search/dash/clusters` +
+        `?origin=COMPANY_PAGE_CANNED_SEARCH` +
+        `&q=all` +
+        `&query=${encodeURIComponent(query)}` +
+        `&start=0` +
+        `&count=${pageSize}`;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+
+      let response: Response;
+      try {
+        response = await fetch(url, { headers, signal: controller.signal });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      console.log(`[people] status=${response.status}`);
+      if (!response.ok) continue;
+
+      const json = await response.json();
+      const employees = parseSearchResults(json, limit);
+      console.log(`[people] Parsed: ${employees.length} employees`);
+      if (employees.length > 0) return employees;
+    } catch (e) {
+      console.log(`[people] Failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  return [];
 }
 
 async function trySearchBlended(
