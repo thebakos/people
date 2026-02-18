@@ -1,57 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCompanyName, searchEmployees } from "@/lib/linkedinSearch";
 import { findCompanyEmployees } from "@/lib/linkedinApi";
-import { findEmail } from "@/lib/emailFinder";
+import { findCompanyDomain, findEmailWithDomain, detectEmailPattern } from "@/lib/emailFinder";
 import { delay } from "@/lib/duckduckgo";
 import { ScraperResult } from "@/lib/types";
 
 export const maxDuration = 120; // Allow up to 2 minutes for processing
-
-/** Process a batch of employees for email lookup in parallel */
-async function findEmailsBatch(
-  employees: { name: string; linkedinUrl: string; headline: string }[],
-  companyName: string,
-  batchSize: number = 5
-): Promise<ScraperResult[]> {
-  const results: ScraperResult[] = [];
-
-  // Process in batches to avoid overwhelming DuckDuckGo
-  for (let i = 0; i < employees.length; i += batchSize) {
-    const batch = employees.slice(i, i + batchSize);
-
-    const batchResults = await Promise.allSettled(
-      batch.map(async (emp) => {
-        let email = "";
-        try {
-          const found = await findEmail(emp.name, companyName);
-          if (found) email = found;
-        } catch (e) {
-          console.error(`Email search failed for ${emp.name}:`, e);
-        }
-        return {
-          companyName,
-          contactName: emp.name,
-          headline: emp.headline,
-          linkedinUrl: emp.linkedinUrl,
-          email,
-        } satisfies ScraperResult;
-      })
-    );
-
-    for (const result of batchResults) {
-      if (result.status === "fulfilled") {
-        results.push(result.value);
-      }
-    }
-
-    // Small delay between batches to respect rate limits
-    if (i + batchSize < employees.length) {
-      await delay(500);
-    }
-  }
-
-  return results;
-}
 
 export async function POST(request: NextRequest) {
   let body: { url: string; linkedinCookie?: string };
@@ -81,22 +35,20 @@ export async function POST(request: NextRequest) {
     let employees: { name: string; linkedinUrl: string; headline: string }[];
 
     if (liAtCookie) {
-      // Use LinkedIn Voyager API with authentication
+      // Use LinkedIn Voyager API with authentication — limit to 10 most relevant
       console.log(`[search] Using LinkedIn API for: ${url}`);
-      console.log(`[search] Cookie present: ${liAtCookie.length} chars`);
-      const result = await findCompanyEmployees(url, liAtCookie);
+      const result = await findCompanyEmployees(url, liAtCookie, 10);
       companyName = result.companyName;
       employees = result.employees;
       console.log(`[search] Company: ${companyName}, Employees found: ${employees.length}`);
-      if (employees.length > 0) {
-        console.log(`[search] First employee: ${employees[0].name} — ${employees[0].headline}`);
-      }
     } else {
       // Fallback: use DuckDuckGo search (may return fewer results)
       console.log("[search] No LinkedIn cookie — falling back to DuckDuckGo search...");
       companyName = await getCompanyName(url);
       await delay(1000);
       employees = await searchEmployees(url, companyName);
+      // Limit to 10 from DuckDuckGo too
+      employees = employees.slice(0, 10);
       console.log(`[search] DuckDuckGo fallback: ${companyName}, ${employees.length} employees`);
     }
 
@@ -111,9 +63,48 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Find emails in parallel batches (5 at a time)
-    const results = await findEmailsBatch(employees, companyName, 5);
+    // Step 1: Find the company's email domain ONCE
+    console.log(`[search] Finding email domain for ${companyName}...`);
+    const domain = await findCompanyDomain(companyName);
+    console.log(`[search] Company domain: ${domain || "not found"}`);
 
+    // Step 2: If we have a domain, try to detect the email pattern from the
+    // first 2 employees (only 2 DDG searches instead of per-person)
+    let pattern: string | null = null;
+    if (domain) {
+      console.log(`[search] Detecting email pattern at @${domain}...`);
+      pattern = await detectEmailPattern(employees.slice(0, 3), domain);
+      console.log(`[search] Detected pattern: ${pattern || "none — will use first.last"}`);
+    }
+
+    // Step 3: Generate emails for all employees using the pattern
+    const results: ScraperResult[] = [];
+
+    for (let i = 0; i < employees.length; i++) {
+      const emp = employees[i];
+      let email = "";
+
+      try {
+        email = await findEmailWithDomain(emp.name, companyName, domain, pattern);
+      } catch (e) {
+        console.error(`[search] Email lookup failed for ${emp.name}:`, e);
+      }
+
+      results.push({
+        companyName,
+        contactName: emp.name,
+        headline: emp.headline,
+        linkedinUrl: emp.linkedinUrl,
+        email,
+      });
+
+      // Small delay between lookups to respect rate limits
+      if (i < employees.length - 1) {
+        await delay(300);
+      }
+    }
+
+    console.log(`[search] Done: ${results.length} contacts, ${results.filter(r => r.email).length} with emails`);
     return NextResponse.json({ companyName, results });
   } catch (error) {
     const message =

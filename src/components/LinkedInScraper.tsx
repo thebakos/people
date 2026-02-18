@@ -272,7 +272,7 @@ export default function LinkedInScraper({
           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none disabled:bg-gray-50 disabled:text-gray-400"
         />
         <p className="text-xs text-gray-500 mt-1">
-          Enter one URL per line. Finds up to 50 employees per company
+          Enter one URL per line. Finds the top 10 key contacts per company
           {linkedinCookie ? "" : " (connect LinkedIn above for best results)"}.
         </p>
       </div>
