@@ -233,12 +233,16 @@ async function trySearchDashClusters(
 
   // Try multiple query formats in case the API changed
   const queryFormats = [
-    // Format 1: Standard with flagshipSearchIntent
+    // Format 1: List-style queryParameters (newer LinkedIn format)
+    `(flagshipSearchIntent:SEARCH_SRP,queryParameters:List((key:currentCompany,value:List(${companyId})),(key:resultType,value:List(PEOPLE))),includeFiltersInResponse:false)`,
+    // Format 2: List-style without includeFiltersInResponse
+    `(flagshipSearchIntent:SEARCH_SRP,queryParameters:List((key:currentCompany,value:List(${companyId})),(key:resultType,value:List(PEOPLE))))`,
+    // Format 3: Map-style (legacy)
     `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
-    // Format 2: Without includeFiltersInResponse
+    // Format 4: Map-style without includeFiltersInResponse
     `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)))`,
-    // Format 3: With keywords param
-    `(flagshipSearchIntent:SEARCH_SRP,keywords:,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`,
+    // Format 5: With keywords param (list-style)
+    `(flagshipSearchIntent:SEARCH_SRP,keywords:,queryParameters:List((key:currentCompany,value:List(${companyId})),(key:resultType,value:List(PEOPLE))),includeFiltersInResponse:false)`,
   ];
 
   const pageSize = Math.min(49, limit);
@@ -324,35 +328,41 @@ async function tryGraphQLSearch(
     "voyagerSearchDashClusters.66adc6056cf4138949ca5dcb31bb1749",
   ];
 
-  const variables = `(start:0,origin:COMPANY_PAGE_CANNED_SEARCH,query:(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false),count:${Math.min(49, limit)})`;
+  // Try both list-style and map-style queryParameters
+  const variableFormats = [
+    `(start:0,origin:COMPANY_PAGE_CANNED_SEARCH,query:(flagshipSearchIntent:SEARCH_SRP,queryParameters:List((key:currentCompany,value:List(${companyId})),(key:resultType,value:List(PEOPLE))),includeFiltersInResponse:false),count:${Math.min(49, limit)})`,
+    `(start:0,origin:COMPANY_PAGE_CANNED_SEARCH,query:(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false),count:${Math.min(49, limit)})`,
+  ];
 
-  for (const queryId of queryIds) {
-    try {
-      const url =
-        `${LINKEDIN_API_BASE}/graphql` +
-        `?includeWebMetadata=true` +
-        `&variables=${encodeURIComponent(variables)}` +
-        `&queryId=${queryId}`;
-
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
-
-      let response: Response;
+  for (const variables of variableFormats) {
+    for (const queryId of queryIds) {
       try {
-        response = await fetch(url, { headers, signal: controller.signal });
-      } finally {
-        clearTimeout(timeout);
+        const url =
+          `${LINKEDIN_API_BASE}/graphql` +
+          `?includeWebMetadata=true` +
+          `&variables=${encodeURIComponent(variables)}` +
+          `&queryId=${queryId}`;
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+
+        let response: Response;
+        try {
+          response = await fetch(url, { headers, signal: controller.signal });
+        } finally {
+          clearTimeout(timeout);
+        }
+
+        console.log(`[graphql] queryId=${queryId.slice(-8)}, status=${response.status}`);
+        if (!response.ok) continue;
+
+        const json = await response.json();
+        const employees = parseSearchResults(json, limit);
+        console.log(`[graphql] Parsed: ${employees.length} employees`);
+        if (employees.length > 0) return employees;
+      } catch (e) {
+        console.log(`[graphql] Failed: ${e instanceof Error ? e.message : e}`);
       }
-
-      console.log(`[graphql] queryId=${queryId.slice(-8)}, status=${response.status}`);
-      if (!response.ok) continue;
-
-      const json = await response.json();
-      const employees = parseSearchResults(json, limit);
-      console.log(`[graphql] Parsed: ${employees.length} employees`);
-      if (employees.length > 0) return employees;
-    } catch (e) {
-      console.log(`[graphql] Failed: ${e instanceof Error ? e.message : e}`);
     }
   }
 
@@ -586,10 +596,157 @@ function parseSearchResults(
 }
 
 /**
+ * Scrape the LinkedIn company page HTML for embedded employee data.
+ * LinkedIn pages embed JSON data in <code> tags that may contain employee info.
+ */
+async function scrapeCompanyPage(
+  companySlug: string,
+  liAtCookie: string,
+  limit: number
+): Promise<LinkedInEmployee[]> {
+  const headers = buildHeaders(liAtCookie);
+  // Override Accept for HTML page
+  headers.Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+  headers.Referer = "https://www.linkedin.com/";
+
+  const employees: LinkedInEmployee[] = [];
+  const seen = new Set<string>();
+
+  // Try both the people page and the main company page
+  const pages = [
+    `https://www.linkedin.com/company/${companySlug}/people/`,
+    `https://www.linkedin.com/company/${companySlug}/`,
+  ];
+
+  for (const pageUrl of pages) {
+    if (employees.length >= limit) break;
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+
+      let response: Response;
+      try {
+        response = await fetch(pageUrl, { headers, signal: controller.signal, redirect: "follow" });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      console.log(`[scrape] ${pageUrl} → ${response.status}`);
+      if (!response.ok) continue;
+
+      const html = await response.text();
+      console.log(`[scrape] Got ${html.length} chars of HTML`);
+
+      // Strategy 1: Parse embedded JSON from <code> tags
+      const codeRegex = /<code[^>]*>([\s\S]*?)<\/code>/g;
+      let match;
+      while ((match = codeRegex.exec(html)) !== null && employees.length < limit) {
+        try {
+          const decoded = match[1]
+            .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+            .replace(/&amp;/g, "&").replace(/&quot;/g, '"');
+          const data = JSON.parse(decoded);
+          const included = data.included || (Array.isArray(data) ? data : []);
+
+          for (const entity of included) {
+            if (employees.length >= limit) break;
+            if (!entity || typeof entity !== "object") continue;
+
+            const type = String(entity.$type || "");
+
+            // MiniProfile entities
+            if (type.includes("MiniProfile") || type.includes("identity.shared.MiniProfile")) {
+              const firstName = String(entity.firstName || "");
+              const lastName = String(entity.lastName || "");
+              const name = `${firstName} ${lastName}`.trim();
+              const publicId = String(entity.publicIdentifier || "");
+              if (!name || !publicId || name === "LinkedIn Member") continue;
+
+              const profileUrl = `https://www.linkedin.com/in/${publicId}`;
+              if (seen.has(profileUrl)) continue;
+              seen.add(profileUrl);
+
+              employees.push({
+                name,
+                headline: String(entity.occupation || entity.headline || ""),
+                linkedinUrl: profileUrl,
+              });
+            }
+          }
+        } catch {
+          // Not valid JSON, skip
+        }
+      }
+
+      // Strategy 2: Parse miniProfile data from JSON-LD or embedded script data
+      const scriptRegex = /<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/g;
+      while ((match = scriptRegex.exec(html)) !== null && employees.length < limit) {
+        try {
+          const data = JSON.parse(match[1]);
+          extractProfilesFromObject(data, employees, seen, limit);
+        } catch {
+          // Not valid JSON
+        }
+      }
+    } catch (e) {
+      console.log(`[scrape] Failed for ${pageUrl}: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  return employees;
+}
+
+/** Recursively extract MiniProfile-like data from nested objects */
+function extractProfilesFromObject(
+  obj: unknown,
+  employees: LinkedInEmployee[],
+  seen: Set<string>,
+  limit: number
+): void {
+  if (employees.length >= limit || !obj || typeof obj !== "object") return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      extractProfilesFromObject(item, employees, seen, limit);
+    }
+    return;
+  }
+
+  const record = obj as Record<string, unknown>;
+
+  // Check if this looks like a profile
+  if (record.publicIdentifier && record.firstName) {
+    const firstName = String(record.firstName || "");
+    const lastName = String(record.lastName || "");
+    const name = `${firstName} ${lastName}`.trim();
+    const publicId = String(record.publicIdentifier || "");
+
+    if (name && publicId && name !== "LinkedIn Member") {
+      const profileUrl = `https://www.linkedin.com/in/${publicId}`;
+      if (!seen.has(profileUrl)) {
+        seen.add(profileUrl);
+        employees.push({
+          name,
+          headline: String(record.occupation || record.headline || ""),
+          linkedinUrl: profileUrl,
+        });
+      }
+    }
+  }
+
+  // Recurse into values (but limit depth)
+  for (const value of Object.values(record)) {
+    if (typeof value === "object" && value !== null) {
+      extractProfilesFromObject(value, employees, seen, limit);
+    }
+  }
+}
+
+/**
  * High-level function: find employees at a LinkedIn company URL.
- * Uses the Voyager API for company info, then tries Voyager search.
- * If Voyager search fails (common in some environments), falls back
- * to DuckDuckGo-based LinkedIn profile search.
+ * Uses the Voyager API for company info, then tries Voyager search,
+ * company page scraping, and web search as fallbacks.
  *
  * IMPORTANT: Does NOT make HEAD requests or validate auth separately —
  * that was causing LinkedIn to invalidate the user's session cookie.
@@ -610,19 +767,27 @@ export async function findCompanyEmployees(
   );
   console.log(`[linkedin] Company found: ${companyName} (ID: ${companyId})`);
 
+  const slug = extractCompanySlug(companyUrl);
   await delay(500);
 
   // Try Voyager search endpoints first
   console.log(`[linkedin] Trying Voyager search for employees (limit: ${limit})...`);
   let employees = await searchCompanyEmployees(companyId, liAtCookie, limit);
 
-  // If Voyager search returned nothing, fall back to DuckDuckGo
+  // If Voyager search returned nothing, try scraping the company page HTML
+  if (employees.length === 0 && slug) {
+    console.log(`[linkedin] Voyager search returned 0 results, trying company page scrape...`);
+    employees = await scrapeCompanyPage(slug, liAtCookie, limit);
+    console.log(`[linkedin] Page scrape found: ${employees.length} employees`);
+  }
+
+  // If still nothing, fall back to web search (DDG/Bing)
   if (employees.length === 0) {
-    console.log(`[linkedin] Voyager search returned 0 results, falling back to DuckDuckGo...`);
+    console.log(`[linkedin] All LinkedIn methods failed, falling back to web search...`);
     employees = await searchEmployees(companyUrl, companyName, limit);
-    console.log(`[linkedin] DuckDuckGo fallback found: ${employees.length} employees`);
+    console.log(`[linkedin] Web search fallback found: ${employees.length} employees`);
   } else {
-    console.log(`[linkedin] Voyager search found: ${employees.length} employees`);
+    console.log(`[linkedin] Found: ${employees.length} employees`);
   }
 
   return { companyName, employees };

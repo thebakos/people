@@ -2,7 +2,7 @@ import { searchDuckDuckGo, searchBing, delay, SearchResult } from "./duckduckgo"
 
 /** Search DDG first, then Bing as fallback */
 async function webSearch(query: string): Promise<SearchResult[]> {
-  const results = await webSearch(query);
+  const results = await searchDuckDuckGo(query);
   if (results.length > 0) return results;
   return searchBing(query);
 }
