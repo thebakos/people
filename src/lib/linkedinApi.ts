@@ -65,6 +65,13 @@ function buildHeaders(
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     Accept: "application/vnd.linkedin.normalized+json+2.1",
+    Referer: "https://www.linkedin.com/search/results/people/",
+    Origin: "https://www.linkedin.com",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
   };
 }
 
@@ -295,7 +302,7 @@ async function trySearchDashClusters(
           `?decorationId=${encodeURIComponent(decorationId)}` +
           `&origin=COMPANY_PAGE_CANNED_SEARCH` +
           `&q=all` +
-          `&query=${query}` +
+          `&query=${encodeURIComponent(query)}` +
           `&start=${start}` +
           `&count=${pageSize}`;
 
@@ -362,7 +369,7 @@ async function trySearchBlended(
       const url =
         `${LINKEDIN_API_BASE}/search/blended` +
         `?count=${pageSize}` +
-        `&filters=List(currentCompany->${companyId},resultType->PEOPLE)` +
+        `&filters=${encodeURIComponent(`List(currentCompany->${companyId},resultType->PEOPLE)`)}` +
         `&origin=COMPANY_PAGE_CANNED_SEARCH` +
         `&q=all` +
         `&start=${start}`;

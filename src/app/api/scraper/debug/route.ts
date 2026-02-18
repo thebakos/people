@@ -1,6 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { validateAuth, getCompanyInfo, searchCompanyEmployees } from "@/lib/linkedinApi";
 
+/** Serialize an error, including its .cause chain */
+function errorDetail(e: unknown): unknown {
+  if (e instanceof Error) {
+    return {
+      message: e.message,
+      name: e.name,
+      cause: e.cause ? errorDetail(e.cause) : undefined,
+      code: (e as NodeJS.ErrnoException).code,
+    };
+  }
+  return String(e);
+}
+
 /**
  * Debug endpoint to test LinkedIn API connectivity and see raw responses.
  * POST /api/scraper/debug
@@ -35,7 +48,7 @@ export async function POST(request: NextRequest) {
       jsessionIdPrefix: authResult.jsessionId?.substring(0, 15) + "...",
     };
   } catch (e) {
-    steps["step1_auth_error"] = String(e);
+    steps["step1_auth_error"] = errorDetail(e);
   }
 
   // Step 2: Company lookup
@@ -54,7 +67,7 @@ export async function POST(request: NextRequest) {
       companyId: info.companyId,
     };
   } catch (e) {
-    steps["step2_company_error"] = String(e);
+    steps["step2_company_error"] = errorDetail(e);
   }
 
   // Step 3: Raw search endpoint tests
@@ -67,9 +80,19 @@ export async function POST(request: NextRequest) {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       Accept: "application/vnd.linkedin.normalized+json+2.1",
+      Referer: "https://www.linkedin.com/search/results/people/",
+      Origin: "https://www.linkedin.com",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"Windows"',
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, deflate, br",
     };
 
-    // 3a: search/dash/clusters — manually built URL (no URLSearchParams encoding)
+    // 3a: search/dash/clusters — URL-encode the query parameter properly
     try {
       const query = `(flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)),includeFiltersInResponse:false)`;
       const decorationId = "com.linkedin.voyager.dash.deco.search.SearchClusterCollection-186";
@@ -78,9 +101,10 @@ export async function POST(request: NextRequest) {
         `?decorationId=${encodeURIComponent(decorationId)}` +
         `&origin=COMPANY_PAGE_CANNED_SEARCH` +
         `&q=all` +
-        `&query=${query}` +
+        `&query=${encodeURIComponent(query)}` +
         `&start=0&count=5`;
 
+      steps["step3a_url"] = url;
       const res = await fetch(url, { headers });
       const resBody = await res.text();
 
@@ -91,13 +115,11 @@ export async function POST(request: NextRequest) {
         const included = (parsed.included || []) as Record<string, unknown>[];
         const types = [...new Set(included.map((e) => String(e.$type || "unknown")))];
 
-        // Find an EntityResultViewModel to inspect its full structure
         const entityResult = included.find((e) =>
           String(e.$type || "").includes("EntityResultViewModel") ||
           String(e.$type || "").includes("EntityResult")
         ) as Record<string, unknown> | undefined;
 
-        // Serialize the entity result, truncating deep values
         const entityResultSnapshot = entityResult
           ? Object.fromEntries(
               Object.entries(entityResult).map(([k, v]) => [
@@ -123,18 +145,20 @@ export async function POST(request: NextRequest) {
         };
       }
     } catch (e) {
-      steps["step3a_error"] = String(e);
+      steps["step3a_error"] = errorDetail(e);
     }
 
-    // 3b: search/blended — manually built URL
+    // 3b: search/blended — URL-encode the filters parameter
     try {
+      const filters = `List(currentCompany->${companyId},resultType->PEOPLE)`;
       const url =
         `https://www.linkedin.com/voyager/api/search/blended` +
         `?count=5` +
-        `&filters=List(currentCompany->${companyId},resultType->PEOPLE)` +
+        `&filters=${encodeURIComponent(filters)}` +
         `&origin=COMPANY_PAGE_CANNED_SEARCH` +
         `&q=all&start=0`;
 
+      steps["step3b_url"] = url;
       const res = await fetch(url, { headers });
       steps["step3b_blended"] = { status: res.status, ok: res.ok };
 
@@ -147,10 +171,10 @@ export async function POST(request: NextRequest) {
         };
       }
     } catch (e) {
-      steps["step3b_error"] = String(e);
+      steps["step3b_error"] = errorDetail(e);
     }
 
-    // 3c: graphql endpoint — variables as JSON in query param
+    // 3c: graphql endpoint — variables as JSON in query param (already encoded)
     try {
       const variables = encodeURIComponent(JSON.stringify({
         start: 0,
@@ -168,6 +192,7 @@ export async function POST(request: NextRequest) {
       const queryId = "voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0";
       const url = `https://www.linkedin.com/voyager/api/graphql?variables=${variables}&queryId=${encodeURIComponent(queryId)}`;
 
+      steps["step3c_url"] = url;
       const res = await fetch(url, { headers });
       const resBody = await res.text();
 
@@ -198,7 +223,17 @@ export async function POST(request: NextRequest) {
         };
       }
     } catch (e) {
-      steps["step3c_error"] = String(e);
+      steps["step3c_error"] = errorDetail(e);
+    }
+
+    // 3d: Simple connectivity test — try fetching a known search-like path
+    try {
+      const simpleUrl = `https://www.linkedin.com/voyager/api/search/dash/clusters?q=all&count=1`;
+      steps["step3d_url"] = simpleUrl;
+      const res = await fetch(simpleUrl, { headers });
+      steps["step3d_simple"] = { status: res.status, ok: res.ok };
+    } catch (e) {
+      steps["step3d_error"] = errorDetail(e);
     }
 
     // Step 4: End-to-end test using our actual search+parse function
@@ -218,7 +253,7 @@ export async function POST(request: NextRequest) {
         })),
       };
     } catch (e) {
-      steps["step4_error"] = String(e);
+      steps["step4_error"] = errorDetail(e);
     }
   }
 
