@@ -35,21 +35,33 @@ export async function POST(request: NextRequest) {
     let employees: { name: string; linkedinUrl: string; headline: string }[];
 
     if (liAtCookie) {
-      // Use LinkedIn Voyager API with authentication — limit to 10 most relevant
-      console.log(`[search] Using LinkedIn API for: ${url}`);
-      const result = await findCompanyEmployees(url, liAtCookie, 10);
-      companyName = result.companyName;
-      employees = result.employees;
-      console.log(`[search] Company: ${companyName}, Employees found: ${employees.length}`);
+      // Try LinkedIn Voyager API first, fall back to DuckDuckGo on any failure
+      try {
+        console.log(`[search] Using LinkedIn API for: ${url}`);
+        const result = await findCompanyEmployees(url, liAtCookie, 10);
+        companyName = result.companyName;
+        employees = result.employees;
+        console.log(`[search] Company: ${companyName}, Employees found: ${employees.length}`);
+      } catch (apiError) {
+        const msg = apiError instanceof Error ? apiError.message : String(apiError);
+        // Re-throw auth errors so the user knows their cookie is bad
+        if (msg.includes("authentication") || msg.includes("expired")) {
+          throw apiError;
+        }
+        // For network/fetch errors, fall back to DuckDuckGo silently
+        console.log(`[search] LinkedIn API failed (${msg}), falling back to DuckDuckGo...`);
+        companyName = await getCompanyName(url);
+        await delay(1000);
+        employees = await searchEmployees(url, companyName, 10);
+        console.log(`[search] DuckDuckGo fallback: ${companyName}, ${employees.length} employees`);
+      }
     } else {
-      // Fallback: use DuckDuckGo search (may return fewer results)
-      console.log("[search] No LinkedIn cookie — falling back to DuckDuckGo search...");
+      // No cookie: use DuckDuckGo search
+      console.log("[search] No LinkedIn cookie — using DuckDuckGo search...");
       companyName = await getCompanyName(url);
       await delay(1000);
-      employees = await searchEmployees(url, companyName);
-      // Limit to 10 from DuckDuckGo too
-      employees = employees.slice(0, 10);
-      console.log(`[search] DuckDuckGo fallback: ${companyName}, ${employees.length} employees`);
+      employees = await searchEmployees(url, companyName, 10);
+      console.log(`[search] DuckDuckGo: ${companyName}, ${employees.length} employees`);
     }
 
     if (employees.length === 0) {
