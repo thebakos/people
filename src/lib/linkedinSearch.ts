@@ -47,72 +47,61 @@ export async function getCompanyName(companyUrl: string): Promise<string> {
 }
 
 /**
- * Search for investment professionals at a company using DuckDuckGo.
- * Searches for LinkedIn profiles associated with the company in investment roles.
+ * Search for professionals at a company using web search (DDG → Bing).
+ * Tries progressively broader queries to maximize results.
  */
 export async function searchEmployees(
   companyUrl: string,
   companyName: string,
   limit: number = 5
 ): Promise<FoundEmployee[]> {
-  const roleTerms = "partner OR director OR principal OR associate OR vice president";
-  const query = `site:linkedin.com/in "${companyName}" ${roleTerms}`;
-
-  const results = await webSearch(query);
-
   const employees: FoundEmployee[] = [];
   const seenUrls = new Set<string>();
 
-  for (const result of results) {
-    if (employees.length >= limit) break;
+  // Progressively broader queries — stop as soon as we hit the limit
+  const queries = [
+    // Query 1: Role-specific (most precise)
+    `site:linkedin.com/in "${companyName}" partner OR director OR principal OR associate OR VP`,
+    // Query 2: Industry terms
+    `site:linkedin.com/in "${companyName}" investment OR venture OR fund OR managing`,
+    // Query 3: Broad — just company name on LinkedIn profiles
+    `site:linkedin.com/in "${companyName}"`,
+    // Query 4: Without quotes (catches partial matches)
+    `site:linkedin.com/in ${companyName}`,
+  ];
 
-    // Only consider linkedin.com/in/ profile pages
-    if (!result.url.includes("linkedin.com/in/")) continue;
+  for (let i = 0; i < queries.length && employees.length < limit; i++) {
+    if (i > 0) await delay(1000);
 
-    // Normalize URL to avoid duplicates
-    const normalizedUrl = normalizeLinkedInUrl(result.url);
-    if (seenUrls.has(normalizedUrl)) continue;
-    seenUrls.add(normalizedUrl);
+    try {
+      const results = await webSearch(queries[i]);
+      console.log(`[search] Query ${i + 1}: "${queries[i].slice(0, 60)}..." → ${results.length} results`);
 
-    // Parse name from the LinkedIn title
-    // Format: "FirstName LastName - Title at Company | LinkedIn"
-    const name = parseNameFromTitle(result.title);
-    if (!name) continue;
+      for (const result of results) {
+        if (employees.length >= limit) break;
 
-    // Extract headline (the part after the name)
-    const headline = parseHeadlineFromTitle(result.title);
+        // Only consider linkedin.com/in/ profile pages
+        if (!result.url.includes("linkedin.com/in/")) continue;
 
-    employees.push({
-      name,
-      linkedinUrl: normalizedUrl,
-      headline,
-    });
-  }
+        // Normalize URL to avoid duplicates
+        const normalizedUrl = normalizeLinkedInUrl(result.url);
+        if (seenUrls.has(normalizedUrl)) continue;
+        seenUrls.add(normalizedUrl);
 
-  // If first query didn't find enough, try a more specific search
-  if (employees.length < limit) {
-    await delay(1000);
-    const query2 = `site:linkedin.com/in "${companyName}" investment OR venture OR fund`;
-    const results2 = await webSearch(query2);
+        // Parse name from the LinkedIn title
+        const name = parseNameFromTitle(result.title);
+        if (!name) continue;
 
-    for (const result of results2) {
-      if (employees.length >= limit) break;
-      if (!result.url.includes("linkedin.com/in/")) continue;
+        const headline = parseHeadlineFromTitle(result.title);
 
-      const normalizedUrl = normalizeLinkedInUrl(result.url);
-      if (seenUrls.has(normalizedUrl)) continue;
-      seenUrls.add(normalizedUrl);
-
-      const name = parseNameFromTitle(result.title);
-      if (!name) continue;
-
-      const headline = parseHeadlineFromTitle(result.title);
-
-      employees.push({
-        name,
-        linkedinUrl: normalizedUrl,
-        headline,
-      });
+        employees.push({
+          name,
+          linkedinUrl: normalizedUrl,
+          headline,
+        });
+      }
+    } catch (e) {
+      console.error(`[search] Query ${i + 1} failed:`, e);
     }
   }
 

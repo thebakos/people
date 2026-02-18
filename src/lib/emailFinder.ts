@@ -1,5 +1,11 @@
-import { searchDuckDuckGo } from "./duckduckgo";
-import { delay } from "./duckduckgo";
+import { searchDuckDuckGo, searchBing, delay, SearchResult } from "./duckduckgo";
+
+/** Search DDG first, then Bing as fallback */
+async function webSearch(query: string): Promise<SearchResult[]> {
+  const results = await webSearch(query);
+  if (results.length > 0) return results;
+  return searchBing(query);
+}
 
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
 
@@ -76,7 +82,7 @@ export async function findCompanyDomain(
 ): Promise<string | null> {
   try {
     // Strategy 1: Search for the company website directly
-    const results = await searchDuckDuckGo(`"${company}" official website`);
+    const results = await webSearch(`"${company}" official website`);
     for (const result of results) {
       const domain = extractCompanyDomain(result.url, company);
       if (domain) return domain;
@@ -85,7 +91,7 @@ export async function findCompanyDomain(
     await delay(500);
 
     // Strategy 2: Look for emails mentioning the company
-    const results2 = await searchDuckDuckGo(`"${company}" "@" email contact`);
+    const results2 = await webSearch(`"${company}" "@" email contact`);
     for (const result of results2) {
       const text = `${result.title} ${result.snippet}`;
       const emails = text.match(EMAIL_REGEX) || [];
@@ -102,7 +108,7 @@ export async function findCompanyDomain(
     // Strategy 3: Try company name as domain directly (common for VCs)
     const slug = company.toLowerCase().replace(/[^a-z0-9]/g, "");
     const commonTlds = [".com", ".vc", ".co", ".io", ".xyz", ".capital"];
-    const results3 = await searchDuckDuckGo(
+    const results3 = await webSearch(
       `site:${slug}.com OR site:${slug}.vc OR site:${slug}.co OR site:${slug}.io "${company}"`
     );
     for (const result of results3) {
@@ -152,7 +158,7 @@ export async function detectEmailPattern(
     try {
       // Search for any email at this domain for this person
       const query = `"${emp.name}" "@${domain}"`;
-      const results = await searchDuckDuckGo(query);
+      const results = await webSearch(query);
 
       for (const result of results) {
         const text = `${result.title} ${result.snippet}`;
@@ -204,7 +210,7 @@ export async function findEmailWithDomain(
 
     // Quick verification: one DDG search to see if this email appears online
     try {
-      const results = await searchDuckDuckGo(`"${email}"`);
+      const results = await webSearch(`"${email}"`);
       if (results.length > 0) {
         for (const result of results) {
           const text = `${result.title} ${result.snippet}`;
@@ -224,7 +230,7 @@ export async function findEmailWithDomain(
   // No domain — try a direct search (1 DDG query)
   if (first && last) {
     try {
-      const results = await searchDuckDuckGo(
+      const results = await webSearch(
         `"${name}" "${company}" email`
       );
       for (const result of results) {
